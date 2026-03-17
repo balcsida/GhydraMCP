@@ -1,11 +1,17 @@
 package eu.starsong.ghidra.endpoints;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import eu.starsong.ghidra.api.ResponseBuilder;
 import eu.starsong.ghidra.util.TransactionHelper;
 import ghidra.framework.plugintool.PluginTool;
+import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
+import ghidra.program.model.listing.Data;
+import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.util.Msg;
 
@@ -40,6 +46,7 @@ public class DataTypeEndpoints extends AbstractEndpoint {
         server.createContext("/datatypes/struct", this::handleCreateStruct);
         server.createContext("/datatypes/enum", this::handleCreateEnum);
         server.createContext("/datatypes/union", this::handleCreateUnion);
+        server.createContext("/datatypes/apply", this::handleApplyDataType);
     }
 
     /**
@@ -167,10 +174,18 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                             Structure struct = new StructureDataType(categoryPath, name, 0, dtm);
 
                             // Parse and add fields if provided
+                            int fieldsAdded = 0;
                             if (fieldsJson != null && !fieldsJson.isEmpty()) {
-                                // TODO: Parse JSON fields array and add components
-                                // For now, create an empty struct
-                                Msg.info(this, "Fields parsing not yet implemented, creating empty struct");
+                                JsonArray fieldsArr = gson.fromJson(fieldsJson, JsonArray.class);
+                                for (JsonElement el : fieldsArr) {
+                                    JsonObject fieldObj = el.getAsJsonObject();
+                                    String fieldName = fieldObj.get("name").getAsString();
+                                    String fieldType = fieldObj.get("type").getAsString();
+                                    int fieldSize = fieldObj.has("size") ? fieldObj.get("size").getAsInt() : -1;
+                                    DataType fieldDt = resolveDataType(dtm, fieldType, fieldSize);
+                                    struct.add(fieldDt, fieldDt.getLength(), fieldName, null);
+                                    fieldsAdded++;
+                                }
                             }
 
                             // Add to data type manager
@@ -182,6 +197,7 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                             resultMap.put("category", added.getCategoryPath().getPath());
                             resultMap.put("length", added.getLength());
                             resultMap.put("kind", "struct");
+                            resultMap.put("fieldsAdded", fieldsAdded);
 
                             return resultMap;
                         });
@@ -243,10 +259,13 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                             EnumDataType enumDt = new EnumDataType(categoryPath, name, size, dtm);
 
                             // Parse and add values if provided
+                            int valuesAdded = 0;
                             if (valuesJson != null && !valuesJson.isEmpty()) {
-                                // TODO: Parse JSON values and add enum members
-                                // For now, create an empty enum
-                                Msg.info(this, "Values parsing not yet implemented, creating empty enum");
+                                JsonObject valuesObj = gson.fromJson(valuesJson, JsonObject.class);
+                                for (Map.Entry<String, JsonElement> entry : valuesObj.entrySet()) {
+                                    enumDt.add(entry.getKey(), entry.getValue().getAsLong());
+                                    valuesAdded++;
+                                }
                             }
 
                             // Add to data type manager
@@ -258,6 +277,7 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                             resultMap.put("category", added.getCategoryPath().getPath());
                             resultMap.put("length", added.getLength());
                             resultMap.put("kind", "enum");
+                            resultMap.put("valuesAdded", valuesAdded);
 
                             return resultMap;
                         });
@@ -318,10 +338,18 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                             UnionDataType union = new UnionDataType(categoryPath, name, dtm);
 
                             // Parse and add fields if provided
+                            int fieldsAdded = 0;
                             if (fieldsJson != null && !fieldsJson.isEmpty()) {
-                                // TODO: Parse JSON fields array and add components
-                                // For now, create an empty union
-                                Msg.info(this, "Fields parsing not yet implemented, creating empty union");
+                                JsonArray fieldsArr = gson.fromJson(fieldsJson, JsonArray.class);
+                                for (JsonElement el : fieldsArr) {
+                                    JsonObject fieldObj = el.getAsJsonObject();
+                                    String fieldName = fieldObj.get("name").getAsString();
+                                    String fieldType = fieldObj.get("type").getAsString();
+                                    int fieldSize = fieldObj.has("size") ? fieldObj.get("size").getAsInt() : -1;
+                                    DataType fieldDt = resolveDataType(dtm, fieldType, fieldSize);
+                                    union.add(fieldDt, fieldDt.getLength(), fieldName, null);
+                                    fieldsAdded++;
+                                }
                             }
 
                             // Add to data type manager
@@ -333,6 +361,7 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                             resultMap.put("category", added.getCategoryPath().getPath());
                             resultMap.put("length", added.getLength());
                             resultMap.put("kind", "union");
+                            resultMap.put("fieldsAdded", fieldsAdded);
 
                             return resultMap;
                         });
@@ -354,6 +383,143 @@ public class DataTypeEndpoints extends AbstractEndpoint {
         } catch (Exception e) {
             Msg.error(this, "Error in /datatypes/union endpoint", e);
             sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Handle POST /datatypes/apply - Apply a data type at a memory address
+     */
+    private void handleApplyDataType(HttpExchange exchange) throws IOException {
+        try {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                sendErrorResponse(exchange, 405, "Method Not Allowed", "METHOD_NOT_ALLOWED");
+                return;
+            }
+
+            Program program = getProgram(exchange);
+            if (program == null) {
+                sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
+                return;
+            }
+
+            Map<String, String> params = parseJsonPostParams(exchange);
+            String addressStr = params.get("address");
+            String typeName = params.get("type_name");
+
+            if (addressStr == null || addressStr.isEmpty()) {
+                sendErrorResponse(exchange, 400, "Missing required parameter: address", "MISSING_PARAMETER");
+                return;
+            }
+            if (typeName == null || typeName.isEmpty()) {
+                sendErrorResponse(exchange, 400, "Missing required parameter: type_name", "MISSING_PARAMETER");
+                return;
+            }
+
+            try {
+                Map<String, Object> result = TransactionHelper.executeInTransaction(
+                        program, "Apply data type " + typeName + " at " + addressStr, () -> {
+                            DataTypeManager dtm = program.getDataTypeManager();
+                            Address addr = program.getAddressFactory().getAddress(addressStr);
+                            if (addr == null) {
+                                throw new IllegalArgumentException("Invalid address: " + addressStr);
+                            }
+
+                            // Search for the data type by name
+                            DataType dt = null;
+                            Iterator<DataType> iter = dtm.getAllDataTypes();
+                            while (iter.hasNext()) {
+                                DataType candidate = iter.next();
+                                if (candidate.getName().equals(typeName)) {
+                                    dt = candidate;
+                                    break;
+                                }
+                            }
+                            if (dt == null) {
+                                throw new IllegalArgumentException("Data type not found: " + typeName);
+                            }
+
+                            // Clear any existing data at the address and apply the type
+                            Listing listing = program.getListing();
+                            listing.clearCodeUnits(addr, addr.add(dt.getLength() - 1), false);
+                            Data newData = listing.createData(addr, dt);
+
+                            Map<String, Object> resultMap = new HashMap<>();
+                            resultMap.put("address", addr.toString());
+                            resultMap.put("type", newData.getDataType().getName());
+                            resultMap.put("length", newData.getLength());
+                            return resultMap;
+                        });
+
+                ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                        .success(true)
+                        .result(result);
+
+                builder.addLink("self", "/datatypes/apply");
+                builder.addLink("datatypes", "/datatypes");
+
+                sendJsonResponse(exchange, builder.build(), 200);
+
+            } catch (Exception e) {
+                Msg.error(this, "Error applying data type", e);
+                sendErrorResponse(exchange, 500, "Failed to apply data type: " + e.getMessage());
+            }
+
+        } catch (Exception e) {
+            Msg.error(this, "Error in /datatypes/apply endpoint", e);
+            sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Resolve a data type by name, handling common primitive types and falling back
+     * to searching the program's data type manager.
+     */
+    private DataType resolveDataType(DataTypeManager dtm, String typeName, int size) {
+        switch (typeName.toLowerCase()) {
+            case "int":
+                return new IntegerDataType();
+            case "uint":
+                return new UnsignedIntegerDataType();
+            case "byte":
+                return new ByteDataType();
+            case "ubyte":
+                return new UnsignedCharDataType();
+            case "short":
+                return new ShortDataType();
+            case "ushort":
+                return new UnsignedShortDataType();
+            case "long":
+                return new LongDataType();
+            case "ulong":
+                return new UnsignedLongDataType();
+            case "longlong":
+                return new LongLongDataType();
+            case "ulonglong":
+                return new UnsignedLongLongDataType();
+            case "float":
+                return new FloatDataType();
+            case "double":
+                return new DoubleDataType();
+            case "char":
+                return new CharDataType();
+            case "bool":
+                return new BooleanDataType();
+            case "void":
+                return new VoidDataType();
+            case "pointer":
+            case "void*":
+            case "pvoid":
+                return new PointerDataType();
+            default:
+                // Search the data type manager for a matching type
+                Iterator<DataType> iter = dtm.getAllDataTypes();
+                while (iter.hasNext()) {
+                    DataType dt = iter.next();
+                    if (dt.getName().equalsIgnoreCase(typeName)) {
+                        return dt;
+                    }
+                }
+                throw new IllegalArgumentException("Unknown data type: " + typeName);
         }
     }
 
