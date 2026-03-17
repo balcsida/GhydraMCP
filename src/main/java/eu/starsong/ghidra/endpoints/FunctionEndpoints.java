@@ -100,7 +100,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
             }
             
             // Get the current program
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program is currently loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -231,7 +231,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
                 String nameRegexFilter = params.get("name_matches_regex");
                 String addrFilter = params.get("addr");
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program is currently loaded", "NO_PROGRAM_LOADED");
                     return;
@@ -393,7 +393,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
      */
     private void handleUpdateFunctionRESTful(HttpExchange exchange, Function function) throws IOException {
         // Implementation similar to handleUpdateFunction but with RESTful response structure
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently loaded", "NO_PROGRAM_LOADED");
             return;
@@ -484,7 +484,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
      * Handle POST requests to create a new function using the RESTful endpoint
      */
     private void handleCreateFunctionRESTful(HttpExchange exchange) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently loaded", "NO_PROGRAM_LOADED");
             return;
@@ -567,7 +567,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
     public void handleFunctions(HttpExchange exchange) throws IOException {
         try {
             // Always check for program availability first
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program is currently loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -851,7 +851,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
      * Handle GET requests to get function details
      */
     public void handleGetFunction(HttpExchange exchange, String functionName) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently loaded", "NO_PROGRAM_LOADED");
             return;
@@ -889,7 +889,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
      * Handle PATCH requests to update a function
      */
     private void handleUpdateFunction(HttpExchange exchange, String functionName) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently loaded", "NO_PROGRAM_LOADED");
             return;
@@ -984,7 +984,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
      * Handle POST requests to create a new function
      */
     private void handleCreateFunction(HttpExchange exchange) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently loaded", "NO_PROGRAM_LOADED");
             return;
@@ -1342,7 +1342,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
             }
             
             // Use transaction to update variable
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -1420,7 +1420,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
      * Helper method to find a function by name
      */
     private Function findFunctionByName(String name) {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             return null;
         }
@@ -1435,7 +1435,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
     }
     
     private Function findFunctionByAddress(String addressString) {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             return null;
         }

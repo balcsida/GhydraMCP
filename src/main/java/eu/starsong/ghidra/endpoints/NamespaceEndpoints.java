@@ -43,7 +43,7 @@ package eu.starsong.ghidra.endpoints;
                     int offset = parseIntOrDefault(qparams.get("offset"), 0);
                     int limit = parseIntOrDefault(qparams.get("limit"), 100);
                     
-                    Program program = getCurrentProgram();
+                    Program program = getProgram(exchange);
                     if (program == null) {
                         sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                         return;

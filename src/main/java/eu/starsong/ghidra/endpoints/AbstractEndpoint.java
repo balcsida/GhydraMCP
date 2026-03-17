@@ -128,13 +128,46 @@ public abstract class AbstractEndpoint implements GhidraJsonEndpoint {
         } catch (Exception e) {
             Msg.error(this, "Error getting current program from tool", e);
         }
-        
+
         // Only fall back to the stored program if dynamic lookup fails
         if (currentProgram != null) {
             return currentProgram;
         }
-        
+
         return null;
+    }
+
+    /**
+     * Get the program to operate on, checking for a ?program=name query parameter first.
+     * This enables multi-file support by allowing any endpoint to target a specific open program.
+     * Falls back to getCurrentProgram() if no program parameter is specified.
+     */
+    protected Program getProgram(HttpExchange exchange) {
+        Map<String, String> params = parseQueryParams(exchange);
+        String programName = params.get("program");
+
+        if (programName != null && !programName.isEmpty()) {
+            try {
+                PluginTool tool = getTool();
+                if (tool != null) {
+                    ProgramManager pm = tool.getService(ProgramManager.class);
+                    if (pm != null) {
+                        for (Program p : pm.getAllOpenPrograms()) {
+                            if (p.getName().equals(programName)) {
+                                return p;
+                            }
+                        }
+                        // No match found - return null so caller can send appropriate error
+                        Msg.warn(this, "Requested program not found among open programs: " + programName);
+                        return null;
+                    }
+                }
+            } catch (Exception e) {
+                Msg.error(this, "Error resolving program by name: " + programName, e);
+            }
+        }
+
+        return getCurrentProgram();
     }
     
     // Can be overridden by subclasses that have a tool reference

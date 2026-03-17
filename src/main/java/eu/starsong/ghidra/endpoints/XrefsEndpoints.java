@@ -74,7 +74,7 @@ public class XrefsEndpoints extends AbstractEndpoint {
                 int offset = parseIntOrDefault(qparams.get("offset"), 0);
                 int limit = parseIntOrDefault(qparams.get("limit"), 50);
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;

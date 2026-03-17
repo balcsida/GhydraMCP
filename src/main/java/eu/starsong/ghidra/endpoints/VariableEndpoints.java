@@ -76,7 +76,7 @@ package eu.starsong.ghidra.endpoints;
                     boolean globalOnly = Boolean.parseBoolean(qparams.getOrDefault("global_only", "false"));
                     
                     // Always get the most current program from the tool
-                    Program program = getCurrentProgram();
+                    Program program = getProgram(exchange);
                     if (program == null) {
                         sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                         return;

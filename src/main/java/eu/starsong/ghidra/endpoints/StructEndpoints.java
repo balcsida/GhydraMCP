@@ -227,7 +227,7 @@ public class StructEndpoints extends AbstractEndpoint {
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String categoryFilter = qparams.get("category");
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -289,7 +289,7 @@ public class StructEndpoints extends AbstractEndpoint {
      */
     private void handleGetStruct(HttpExchange exchange, String structName) throws IOException {
         try {
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -352,7 +352,7 @@ public class StructEndpoints extends AbstractEndpoint {
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -448,7 +448,7 @@ public class StructEndpoints extends AbstractEndpoint {
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -575,7 +575,7 @@ public class StructEndpoints extends AbstractEndpoint {
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -713,7 +713,7 @@ public class StructEndpoints extends AbstractEndpoint {
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;

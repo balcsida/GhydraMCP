@@ -45,13 +45,19 @@ public class ProgramEndpoints extends AbstractEndpoint {
     @Override
     public void registerEndpoints(HttpServer server) {
         server.createContext("/program", this::handleProgramInfo);
-        
+
         // Register address and function endpoints
         server.createContext("/address", this::handleCurrentAddress);
         server.createContext("/function", this::handleCurrentFunction);
-        
+
         // Register direct analysis endpoints according to HATEOAS API
         server.createContext("/analysis/callgraph", this::handleCallGraph);
+
+        // Multi-file management endpoints
+        server.createContext("/programs/open-programs", this::handleListOpenPrograms);
+        server.createContext("/programs/open", this::handleOpenProgram);
+        server.createContext("/programs/close", this::handleCloseProgram);
+        server.createContext("/programs/switch", this::handleSwitchProgram);
     }
 
     @Override
@@ -138,6 +144,244 @@ public class ProgramEndpoints extends AbstractEndpoint {
         builder.addLink("create", "/programs", "POST");
         
         sendJsonResponse(exchange, builder.build(), 200);
+    }
+
+    /**
+     * Handle GET /programs/open-programs - List all currently open programs in this tool
+     */
+    private void handleListOpenPrograms(HttpExchange exchange) throws IOException {
+        try {
+            if (!"GET".equals(exchange.getRequestMethod())) {
+                sendErrorResponse(exchange, 405, "Method Not Allowed", "METHOD_NOT_ALLOWED");
+                return;
+            }
+
+            ProgramManager pm = tool.getService(ProgramManager.class);
+            if (pm == null) {
+                sendErrorResponse(exchange, 503, "ProgramManager service not available", "SERVICE_UNAVAILABLE");
+                return;
+            }
+
+            Program currentProg = pm.getCurrentProgram();
+            List<Map<String, Object>> openPrograms = new ArrayList<>();
+
+            for (Program p : pm.getAllOpenPrograms()) {
+                Map<String, Object> info = new HashMap<>();
+                info.put("name", p.getName());
+                info.put("path", p.getDomainFile().getPathname());
+                info.put("isCurrent", p.equals(currentProg));
+                info.put("language", p.getLanguage().getLanguageID().getIdAsString());
+                info.put("processor", p.getLanguage().getProcessor().toString());
+                info.put("addressSize", p.getAddressFactory().getDefaultAddressSpace().getSize());
+                info.put("imageBase", p.getImageBase().toString());
+                info.put("memorySize", p.getMemory().getSize());
+                info.put("executablePath", p.getExecutablePath());
+                openPrograms.add(info);
+            }
+
+            ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                .success(true)
+                .result(openPrograms);
+
+            builder.addLink("self", "/programs/open-programs");
+            builder.addLink("open", "/programs/open", "POST");
+            builder.addLink("close", "/programs/close", "POST");
+            builder.addLink("switch", "/programs/switch", "POST");
+
+            sendJsonResponse(exchange, builder.build(), 200);
+        } catch (Exception e) {
+            Msg.error(this, "Error in /programs/open-programs", e);
+            sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Handle POST /programs/open - Open a project file as a program in this tool.
+     * Body: { "path": "/path/in/project" }
+     */
+    private void handleOpenProgram(HttpExchange exchange) throws IOException {
+        try {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                sendErrorResponse(exchange, 405, "Method Not Allowed", "METHOD_NOT_ALLOWED");
+                return;
+            }
+
+            Map<String, String> params = parseJsonPostParams(exchange);
+            String filePath = params.get("path");
+
+            if (filePath == null || filePath.isEmpty()) {
+                sendErrorResponse(exchange, 400, "Missing required parameter: path", "MISSING_PARAMETER");
+                return;
+            }
+
+            Project project = tool.getProject();
+            if (project == null) {
+                sendErrorResponse(exchange, 503, "No project is currently open", "NO_PROJECT_OPEN");
+                return;
+            }
+
+            ghidra.framework.model.DomainFile file = project.getProjectData().getFile(filePath);
+            if (file == null) {
+                sendErrorResponse(exchange, 404, "File not found: " + filePath, "FILE_NOT_FOUND");
+                return;
+            }
+
+            ProgramManager pm = tool.getService(ProgramManager.class);
+            if (pm == null) {
+                sendErrorResponse(exchange, 503, "ProgramManager service not available", "SERVICE_UNAVAILABLE");
+                return;
+            }
+
+            // Check if already open
+            for (Program p : pm.getAllOpenPrograms()) {
+                if (p.getDomainFile().equals(file)) {
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("name", p.getName());
+                    result.put("path", filePath);
+                    result.put("alreadyOpen", true);
+
+                    ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                        .success(true)
+                        .result(result);
+                    sendJsonResponse(exchange, builder.build(), 200);
+                    return;
+                }
+            }
+
+            // Open the program (OPEN_VISIBLE keeps it open but doesn't switch to it)
+            Program opened = pm.openProgram(file, ghidra.framework.model.DomainFile.DEFAULT_VERSION,
+                ProgramManager.OPEN_VISIBLE);
+
+            if (opened == null) {
+                sendErrorResponse(exchange, 500, "Failed to open file: " + filePath, "OPEN_FAILED");
+                return;
+            }
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("name", opened.getName());
+            result.put("path", filePath);
+            result.put("opened", true);
+            result.put("language", opened.getLanguage().getLanguageID().getIdAsString());
+
+            ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                .success(true)
+                .result(result);
+            builder.addLink("open_programs", "/programs/open-programs");
+            sendJsonResponse(exchange, builder.build(), 200);
+        } catch (Exception e) {
+            Msg.error(this, "Error in /programs/open", e);
+            sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Handle POST /programs/close - Close an open program.
+     * Body: { "name": "program_name" }
+     */
+    private void handleCloseProgram(HttpExchange exchange) throws IOException {
+        try {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                sendErrorResponse(exchange, 405, "Method Not Allowed", "METHOD_NOT_ALLOWED");
+                return;
+            }
+
+            Map<String, String> params = parseJsonPostParams(exchange);
+            String programName = params.get("name");
+
+            if (programName == null || programName.isEmpty()) {
+                sendErrorResponse(exchange, 400, "Missing required parameter: name", "MISSING_PARAMETER");
+                return;
+            }
+
+            ProgramManager pm = tool.getService(ProgramManager.class);
+            if (pm == null) {
+                sendErrorResponse(exchange, 503, "ProgramManager service not available", "SERVICE_UNAVAILABLE");
+                return;
+            }
+
+            Program target = null;
+            for (Program p : pm.getAllOpenPrograms()) {
+                if (p.getName().equals(programName)) {
+                    target = p;
+                    break;
+                }
+            }
+
+            if (target == null) {
+                sendErrorResponse(exchange, 404, "Program not open: " + programName, "PROGRAM_NOT_FOUND");
+                return;
+            }
+
+            pm.closeProgram(target, true);
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("name", programName);
+            result.put("closed", true);
+
+            ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                .success(true)
+                .result(result);
+            builder.addLink("open_programs", "/programs/open-programs");
+            sendJsonResponse(exchange, builder.build(), 200);
+        } catch (Exception e) {
+            Msg.error(this, "Error in /programs/close", e);
+            sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Handle POST /programs/switch - Switch the active/current program.
+     * Body: { "name": "program_name" }
+     */
+    private void handleSwitchProgram(HttpExchange exchange) throws IOException {
+        try {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                sendErrorResponse(exchange, 405, "Method Not Allowed", "METHOD_NOT_ALLOWED");
+                return;
+            }
+
+            Map<String, String> params = parseJsonPostParams(exchange);
+            String programName = params.get("name");
+
+            if (programName == null || programName.isEmpty()) {
+                sendErrorResponse(exchange, 400, "Missing required parameter: name", "MISSING_PARAMETER");
+                return;
+            }
+
+            ProgramManager pm = tool.getService(ProgramManager.class);
+            if (pm == null) {
+                sendErrorResponse(exchange, 503, "ProgramManager service not available", "SERVICE_UNAVAILABLE");
+                return;
+            }
+
+            Program target = null;
+            for (Program p : pm.getAllOpenPrograms()) {
+                if (p.getName().equals(programName)) {
+                    target = p;
+                    break;
+                }
+            }
+
+            if (target == null) {
+                sendErrorResponse(exchange, 404, "Program not open: " + programName, "PROGRAM_NOT_FOUND");
+                return;
+            }
+
+            pm.setCurrentProgram(target);
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("name", programName);
+            result.put("switched", true);
+
+            ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                .success(true)
+                .result(result);
+            builder.addLink("open_programs", "/programs/open-programs");
+            sendJsonResponse(exchange, builder.build(), 200);
+        } catch (Exception e) {
+            Msg.error(this, "Error in /programs/switch", e);
+            sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage());
+        }
     }
 
     /**
@@ -274,7 +518,7 @@ public class ProgramEndpoints extends AbstractEndpoint {
             
             if ("GET".equals(method)) {
                 // Get current program details
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
 
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program is currently open", "NO_PROGRAM_OPEN");
@@ -317,7 +561,7 @@ public class ProgramEndpoints extends AbstractEndpoint {
     }
     
     private void handleCurrentSegments(HttpExchange exchange) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently open", "NO_PROGRAM_OPEN");
             return;
@@ -327,7 +571,7 @@ public class ProgramEndpoints extends AbstractEndpoint {
     }
     
     private void handleCurrentFunctions(HttpExchange exchange) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently open", "NO_PROGRAM_OPEN");
             return;
@@ -337,7 +581,7 @@ public class ProgramEndpoints extends AbstractEndpoint {
     }
     
     private void handleFunctionByAddress(HttpExchange exchange) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently open", "NO_PROGRAM_OPEN");
             return;
@@ -403,7 +647,7 @@ public class ProgramEndpoints extends AbstractEndpoint {
     }
     
     private void handleFunctionByName(HttpExchange exchange) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently open", "NO_PROGRAM_OPEN");
             return;
@@ -470,8 +714,8 @@ public class ProgramEndpoints extends AbstractEndpoint {
         // Get the program
         Program program;
         if (isCurrentProgram) {
-            // Use getCurrentProgram() which now dynamically checks for program availability
-            program = getCurrentProgram();
+            // Use getProgram() which checks for ?program= param and falls back to current
+            program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program is currently open", "NO_PROGRAM_OPEN");
                 return;
@@ -1328,7 +1572,7 @@ public class ProgramEndpoints extends AbstractEndpoint {
             result.put("address", currentAddress);
             
             // Get program name if available
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program != null) {
                 result.put("program", program.getName());
             }
@@ -1374,7 +1618,7 @@ public class ProgramEndpoints extends AbstractEndpoint {
                 return;
             }
             
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM");
                 return;
@@ -1463,7 +1707,7 @@ public class ProgramEndpoints extends AbstractEndpoint {
      * Handle call graph generation
      */
     private void handleCallGraph(HttpExchange exchange) throws IOException {
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program is currently open", "NO_PROGRAM_OPEN");
             return;

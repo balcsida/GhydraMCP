@@ -80,7 +80,7 @@ public class MemoryEndpoints extends AbstractEndpoint {
                 builder.addLink("program", "/program");
                 builder.addLink("blocks", "/memory/blocks");
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;
@@ -252,7 +252,7 @@ private void handleMemoryAddressRequest(HttpExchange exchange) throws IOExceptio
 private void handleMemoryComments(HttpExchange exchange, String addressStr, String commentType) throws IOException {
     try {
         String method = exchange.getRequestMethod();
-        Program program = getCurrentProgram();
+        Program program = getProgram(exchange);
         
         if (program == null) {
             sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
@@ -394,7 +394,7 @@ private void handleDisassemblyAtAddress(HttpExchange exchange, String addressStr
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -485,7 +485,7 @@ private void handleDisassemblyAtAddress(HttpExchange exchange, String addressStr
                 int offset = parseIntOrDefault(qparams.get("offset"), 0);
                 int limit = parseIntOrDefault(qparams.get("limit"), 100);
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;

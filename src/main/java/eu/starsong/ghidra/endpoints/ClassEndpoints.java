@@ -45,7 +45,7 @@ package eu.starsong.ghidra.endpoints;
                     int limit = parseIntOrDefault(qparams.get("limit"), 100);
                     
                     // Always get the most current program from the tool
-                    Program program = getCurrentProgram();
+                    Program program = getProgram(exchange);
                     if (program == null) {
                         sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                         return;

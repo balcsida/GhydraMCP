@@ -52,7 +52,7 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -141,7 +141,7 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -216,7 +216,7 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
@@ -292,7 +292,7 @@ public class DataTypeEndpoints extends AbstractEndpoint {
                 return;
             }
 
-            Program program = getCurrentProgram();
+            Program program = getProgram(exchange);
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;

@@ -100,7 +100,7 @@ package eu.starsong.ghidra.endpoints;
                         boolean hasType = params.containsKey("type") && params.get("type") != null && !params.get("type").isEmpty();
 
                         if (params.containsKey("address") && hasType) {
-                            Program program = getCurrentProgram();
+                            Program program = getProgram(exchange);
                             if (program != null) {
                                 try {
                                     Address addr = program.getAddressFactory().getAddress(params.get("address"));
@@ -201,7 +201,7 @@ package eu.starsong.ghidra.endpoints;
                 int offset = parseIntOrDefault(qparams.get("offset"), 0);
                 int limit = parseIntOrDefault(qparams.get("limit"), 100);
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;
@@ -277,7 +277,7 @@ package eu.starsong.ghidra.endpoints;
                     return;
                 }
 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;
@@ -472,7 +472,7 @@ package eu.starsong.ghidra.endpoints;
                     return;
                 }
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;
@@ -595,7 +595,7 @@ package eu.starsong.ghidra.endpoints;
                     return;
                 }
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;
@@ -752,7 +752,7 @@ package eu.starsong.ghidra.endpoints;
                     return;
                 }
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;
@@ -951,7 +951,7 @@ package eu.starsong.ghidra.endpoints;
                         return;
                     }
                     
-                    Program program = getCurrentProgram();
+                    Program program = getProgram(exchange);
                     if (program == null) {
                         sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                         return;
@@ -1054,7 +1054,7 @@ package eu.starsong.ghidra.endpoints;
                     return;
                 }
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;
@@ -1141,7 +1141,7 @@ package eu.starsong.ghidra.endpoints;
                 int limit = parseIntOrDefault(qparams.get("limit"), 2000);
                 String filter = qparams.get("filter");
                 
-                Program program = getCurrentProgram();
+                Program program = getProgram(exchange);
                 if (program == null) {
                     sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                     return;
