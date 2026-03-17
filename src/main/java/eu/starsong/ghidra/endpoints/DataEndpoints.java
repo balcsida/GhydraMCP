@@ -10,6 +10,7 @@ package eu.starsong.ghidra.endpoints;
     import eu.starsong.ghidra.util.TransactionHelper.TransactionException;
     import ghidra.program.model.address.Address;
     import ghidra.framework.plugintool.PluginTool;
+    import ghidra.program.model.listing.CommentType;
     import ghidra.program.model.listing.Data;
     import ghidra.program.model.listing.DataIterator;
     import ghidra.program.model.listing.Listing;
@@ -21,6 +22,7 @@ package eu.starsong.ghidra.endpoints;
     import ghidra.util.Msg;
 
     import java.io.IOException;
+    import java.nio.charset.StandardCharsets;
     import java.util.*;
     import java.util.concurrent.atomic.AtomicBoolean;
     import javax.swing.SwingUtilities;
@@ -70,6 +72,27 @@ package eu.starsong.ghidra.endpoints;
                 if ("POST".equals(exchange.getRequestMethod()) || "PATCH".equals(exchange.getRequestMethod())) {
                     Map<String, String> params = parseJsonPostParams(exchange);
                     handleTypeChangeData(exchange, params);
+                } else {
+                    sendErrorResponse(exchange, 405, "Method Not Allowed");
+                }
+            }, port));
+            server.createContext("/data/clear", HttpUtil.safeHandler(exchange -> {
+                if ("POST".equals(exchange.getRequestMethod())) {
+                    handleClearData(exchange);
+                } else {
+                    sendErrorResponse(exchange, 405, "Method Not Allowed");
+                }
+            }, port));
+            server.createContext("/data/label", HttpUtil.safeHandler(exchange -> {
+                if ("POST".equals(exchange.getRequestMethod())) {
+                    handleCreateLabel(exchange);
+                } else {
+                    sendErrorResponse(exchange, 405, "Method Not Allowed");
+                }
+            }, port));
+            server.createContext("/data/at/", HttpUtil.safeHandler(exchange -> {
+                if ("GET".equals(exchange.getRequestMethod())) {
+                    handleDataAt(exchange);
                 } else {
                     sendErrorResponse(exchange, 405, "Method Not Allowed");
                 }
@@ -1219,6 +1242,227 @@ package eu.starsong.ghidra.endpoints;
             } catch (Exception e) {
                 Msg.error(this, "Error listing strings", e);
                 sendErrorResponse(exchange, 500, "Error listing strings: " + e.getMessage(), "INTERNAL_ERROR");
+            }
+        }
+
+        /**
+         * POST /data/clear - Clear/undefine data at an address.
+         * Body: { "address": "0x...", "size": 4 }
+         */
+        private void handleClearData(HttpExchange exchange) throws IOException {
+            try {
+                Map<String, String> params = parseJsonPostParams(exchange);
+                String addressStr = params.get("address");
+                String sizeStr = params.get("size");
+
+                if (addressStr == null || addressStr.isEmpty()) {
+                    sendErrorResponse(exchange, 400, "Missing required parameter: address", "MISSING_PARAMETERS");
+                    return;
+                }
+
+                int size = 1;
+                if (sizeStr != null && !sizeStr.isEmpty()) {
+                    try {
+                        size = Integer.parseInt(sizeStr);
+                        if (size <= 0) {
+                            sendErrorResponse(exchange, 400, "Size must be a positive integer", "INVALID_PARAMETER");
+                            return;
+                        }
+                    } catch (NumberFormatException e) {
+                        sendErrorResponse(exchange, 400, "Invalid size parameter: must be an integer", "INVALID_PARAMETER");
+                        return;
+                    }
+                }
+
+                Program program = getProgram(exchange);
+                if (program == null) {
+                    sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
+                    return;
+                }
+
+                final int clearSize = size;
+                try {
+                    TransactionHelper.executeInTransaction(program, "Clear data at " + addressStr, () -> {
+                        Address addr = program.getAddressFactory().getAddress(addressStr);
+                        if (addr == null) {
+                            throw new Exception("Invalid address: " + addressStr);
+                        }
+                        program.getListing().clearCodeUnits(addr, addr.add(clearSize - 1), false);
+                        return null;
+                    });
+                } catch (TransactionException e) {
+                    Msg.error(this, "Transaction failed: Clear data", e);
+                    sendErrorResponse(exchange, 500, "Failed to clear data: " + e.getMessage(), "TRANSACTION_ERROR");
+                    return;
+                }
+
+                Map<String, Object> resultMap = new HashMap<>();
+                resultMap.put("address", addressStr);
+                resultMap.put("size", clearSize);
+                resultMap.put("message", "Data cleared successfully");
+
+                ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                    .success(true)
+                    .result(resultMap)
+                    .addLink("self", "/data/clear")
+                    .addLink("data", "/data");
+
+                sendJsonResponse(exchange, builder.build(), 200);
+
+            } catch (Exception e) {
+                Msg.error(this, "Error clearing data", e);
+                sendErrorResponse(exchange, 500, "Error clearing data: " + e.getMessage(), "INTERNAL_ERROR");
+            }
+        }
+
+        /**
+         * POST /data/label - Create a label at an address.
+         * Body: { "address": "0x...", "name": "label_name" }
+         */
+        private void handleCreateLabel(HttpExchange exchange) throws IOException {
+            try {
+                Map<String, String> params = parseJsonPostParams(exchange);
+                String addressStr = params.get("address");
+                String name = params.get("name");
+
+                if (addressStr == null || addressStr.isEmpty()) {
+                    sendErrorResponse(exchange, 400, "Missing required parameter: address", "MISSING_PARAMETERS");
+                    return;
+                }
+                if (name == null || name.isEmpty()) {
+                    sendErrorResponse(exchange, 400, "Missing required parameter: name", "MISSING_PARAMETERS");
+                    return;
+                }
+
+                Program program = getProgram(exchange);
+                if (program == null) {
+                    sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
+                    return;
+                }
+
+                try {
+                    TransactionHelper.executeInTransaction(program, "Create label at " + addressStr, () -> {
+                        Address addr = program.getAddressFactory().getAddress(addressStr);
+                        if (addr == null) {
+                            throw new Exception("Invalid address: " + addressStr);
+                        }
+                        program.getSymbolTable().createLabel(addr, name, SourceType.USER_DEFINED);
+                        return null;
+                    });
+                } catch (TransactionException e) {
+                    Msg.error(this, "Transaction failed: Create label", e);
+                    sendErrorResponse(exchange, 500, "Failed to create label: " + e.getMessage(), "TRANSACTION_ERROR");
+                    return;
+                }
+
+                Map<String, Object> resultMap = new HashMap<>();
+                resultMap.put("address", addressStr);
+                resultMap.put("name", name);
+                resultMap.put("message", "Label created successfully");
+
+                ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                    .success(true)
+                    .result(resultMap)
+                    .addLink("self", "/data/label")
+                    .addLink("data", "/data")
+                    .addLink("data_at", "/data/at/" + addressStr);
+
+                sendJsonResponse(exchange, builder.build(), 200);
+
+            } catch (Exception e) {
+                Msg.error(this, "Error creating label", e);
+                sendErrorResponse(exchange, 500, "Error creating label: " + e.getMessage(), "INTERNAL_ERROR");
+            }
+        }
+
+        /**
+         * GET /data/at/{address} - Get detailed data info at a specific address.
+         * Returns the data item's name, type, value, size, and any containing structure.
+         */
+        private void handleDataAt(HttpExchange exchange) throws IOException {
+            try {
+                String path = exchange.getRequestURI().getPath();
+                String addressStr = path.substring("/data/at/".length());
+                addressStr = java.net.URLDecoder.decode(addressStr, StandardCharsets.UTF_8);
+
+                if (addressStr.isEmpty()) {
+                    sendErrorResponse(exchange, 400, "Missing address in URL path", "MISSING_PARAMETERS");
+                    return;
+                }
+
+                Program program = getProgram(exchange);
+                if (program == null) {
+                    sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
+                    return;
+                }
+
+                Address addr = program.getAddressFactory().getAddress(addressStr);
+                if (addr == null) {
+                    sendErrorResponse(exchange, 400, "Invalid address: " + addressStr, "INVALID_PARAMETER");
+                    return;
+                }
+
+                Listing listing = program.getListing();
+                Data data = listing.getDefinedDataAt(addr);
+
+                // If no defined data at exact address, try getDataContaining
+                if (data == null) {
+                    data = listing.getDataContaining(addr);
+                }
+
+                if (data == null) {
+                    sendErrorResponse(exchange, 404, "No data found at address: " + addressStr, "DATA_NOT_FOUND");
+                    return;
+                }
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("address", data.getAddress().toString());
+                result.put("name", data.getLabel() != null ? data.getLabel() : "(unnamed)");
+                result.put("dataType", data.getDataType().getName());
+                result.put("value", data.getDefaultValueRepresentation());
+                result.put("size", data.getLength());
+
+                // Check for containing structure
+                Data parent = data.getParent();
+                if (parent != null && parent instanceof Data) {
+                    Map<String, Object> containingInfo = new HashMap<>();
+                    containingInfo.put("address", parent.getAddress().toString());
+                    containingInfo.put("dataType", parent.getDataType().getName());
+                    containingInfo.put("name", parent.getLabel() != null ? parent.getLabel() : "(unnamed)");
+                    result.put("containingStructure", containingInfo);
+                }
+
+                // Add symbol info if available
+                Symbol[] symbols = program.getSymbolTable().getSymbols(addr);
+                if (symbols != null && symbols.length > 0) {
+                    List<String> symbolNames = new ArrayList<>();
+                    for (Symbol sym : symbols) {
+                        symbolNames.add(safeGetSymbolName(sym, program));
+                    }
+                    result.put("symbols", symbolNames);
+                }
+
+                // Check if address has comments
+                for (CommentType ct : new CommentType[] {
+                        CommentType.EOL, CommentType.PLATE, CommentType.PRE,
+                        CommentType.POST, CommentType.REPEATABLE }) {
+                    String comment = listing.getComment(ct, addr);
+                    if (comment != null) {
+                        result.put("comment_" + ct.name().toLowerCase(), comment);
+                    }
+                }
+
+                ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                    .success(true)
+                    .result(result)
+                    .addLink("self", "/data/at/" + addressStr)
+                    .addLink("data", "/data");
+
+                sendJsonResponse(exchange, builder.build(), 200);
+
+            } catch (Exception e) {
+                Msg.error(this, "Error getting data at address", e);
+                sendErrorResponse(exchange, 500, "Error: " + e.getMessage(), "INTERNAL_ERROR");
             }
         }
     }
