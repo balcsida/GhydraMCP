@@ -47,12 +47,19 @@ Then use `instances_use(port)` to set your working instance.
 
 Note: Use `instances_discover(host)` only if you need to scan a different host.
 
+Multi-file support: A single Ghidra instance can have multiple programs open simultaneously.
+- Use `programs_list_open()` to see all open programs
+- Use `programs_open(path)` to open another binary from the project
+- Use `programs_switch(name)` to change the active program
+- Pass `program=name` parameter to any tool to target a specific open program without switching
+
 The API is organized into namespaces for different types of operations:
 - instances_* : For managing Ghidra instances
+- programs_*  : For managing multiple open programs in an instance
 - functions_* : For working with functions
 - data_* : For working with data items
 - structs_* : For creating and managing struct data types
-- memory_* : For memory access
+- memory_* : For memory access and byte searching
 - xrefs_* : For cross-references
 - analysis_* : For program analysis
 - classes_* : For listing classes and namespaces
@@ -61,6 +68,8 @@ The API is organized into namespaces for different types of operations:
 - namespaces_* : For namespace hierarchy
 - variables_* : For global and local variables
 - datatypes_* : For data type management
+- bookmarks_* : For managing bookmarks
+- batch_* : For batch operations (rename, comment, define)
 """
 
 mcp = FastMCP("GhydraMCP", version=BRIDGE_VERSION, instructions=instructions)
@@ -111,11 +120,21 @@ def validate_origin(headers: dict) -> bool:
 
     return origin_base in ALLOWED_ORIGINS
 
-def _make_request(method: str, port: int, endpoint: str, params: dict = None, 
-                 json_data: dict = None, data: str = None, 
-                 headers: dict = None) -> dict:
-    """Internal helper to make HTTP requests and handle common errors."""
+def _make_request(method: str, port: int, endpoint: str, params: dict = None,
+                 json_data: dict = None, data: str = None,
+                 headers: dict = None, program: str = None) -> dict:
+    """Internal helper to make HTTP requests and handle common errors.
+
+    Args:
+        program: Target a specific open program by name (multi-file support).
+                 When set, adds ?program=name to the request.
+    """
     url = f"{get_instance_url(port)}/{endpoint}"
+
+    # Inject program parameter for multi-file support
+    if program:
+        params = dict(params) if params else {}
+        params["program"] = program
     
     # Set up headers according to HATEOAS API expected format
     request_headers = {
@@ -231,16 +250,16 @@ def _make_request(method: str, port: int, endpoint: str, params: dict = None,
             "timestamp": int(time.time() * 1000)
         }
 
-def safe_get(port: int, endpoint: str, params: dict = None) -> dict:
+def safe_get(port: int, endpoint: str, params: dict = None, program: str = None) -> dict:
     """Make GET request to Ghidra instance"""
-    return _make_request("GET", port, endpoint, params=params)
+    return _make_request("GET", port, endpoint, params=params, program=program)
 
-def safe_put(port: int, endpoint: str, data: dict) -> dict:
+def safe_put(port: int, endpoint: str, data: dict, program: str = None) -> dict:
     """Make PUT request to Ghidra instance with JSON payload"""
     headers = data.pop("headers", None) if isinstance(data, dict) else None
-    return _make_request("PUT", port, endpoint, json_data=data, headers=headers)
+    return _make_request("PUT", port, endpoint, json_data=data, headers=headers, program=program)
 
-def safe_post(port: int, endpoint: str, data: Union[dict, str]) -> dict:
+def safe_post(port: int, endpoint: str, data: Union[dict, str], program: str = None) -> dict:
     """Perform a POST request to a specific Ghidra instance with JSON or text payload"""
     headers = None
     json_payload = None
@@ -252,16 +271,16 @@ def safe_post(port: int, endpoint: str, data: Union[dict, str]) -> dict:
     else:
         text_payload = data
 
-    return _make_request("POST", port, endpoint, json_data=json_payload, data=text_payload, headers=headers)
+    return _make_request("POST", port, endpoint, json_data=json_payload, data=text_payload, headers=headers, program=program)
 
-def safe_patch(port: int, endpoint: str, data: dict) -> dict:
+def safe_patch(port: int, endpoint: str, data: dict, program: str = None) -> dict:
     """Perform a PATCH request to a specific Ghidra instance with JSON payload"""
     headers = data.pop("headers", None) if isinstance(data, dict) else None
-    return _make_request("PATCH", port, endpoint, json_data=data, headers=headers)
+    return _make_request("PATCH", port, endpoint, json_data=data, headers=headers, program=program)
 
-def safe_delete(port: int, endpoint: str) -> dict:
+def safe_delete(port: int, endpoint: str, program: str = None) -> dict:
     """Perform a DELETE request to a specific Ghidra instance"""
-    return _make_request("DELETE", port, endpoint)
+    return _make_request("DELETE", port, endpoint, program=program)
 
 
 # ================= Text Formatters =================
@@ -1932,27 +1951,105 @@ def instances_current() -> dict:
     """
     return ghidra_instance(port=current_instance_port)
 
+
+# Multi-file management tools
+
+@mcp.tool()
+@text_output
+def programs_list_open(port: int = None) -> dict:
+    """List all currently open programs/files in the Ghidra instance
+
+    Use this to see which binaries are open and which one is the active/current program.
+    Each program can be targeted by name using the 'program' parameter in other tools.
+
+    Args:
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: List of open programs with name, path, language, and isCurrent flag
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_get(port, "programs/open-programs"))
+
+
+@mcp.tool()
+@text_output
+def programs_open(path: str, port: int = None) -> dict:
+    """Open a project file as a program in the current Ghidra instance
+
+    Opens a binary from the Ghidra project without switching away from the current program.
+    Use project_list_files() to see available files.
+
+    Args:
+        path: Path to the file within the Ghidra project (e.g. "/malware.exe")
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Information about the opened program
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "programs/open", {"path": path}))
+
+
+@mcp.tool()
+@text_output
+def programs_close(name: str, port: int = None) -> dict:
+    """Close an open program in the Ghidra instance
+
+    Args:
+        name: Name of the program to close (as shown by programs_list_open)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Confirmation that the program was closed
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "programs/close", {"name": name}))
+
+
+@mcp.tool()
+@text_output
+def programs_switch(name: str, port: int = None) -> dict:
+    """Switch the active/current program in the Ghidra instance
+
+    Changes which program is the default for all operations.
+    Alternatively, pass ?program=name to any tool to target a specific program
+    without switching.
+
+    Args:
+        name: Name of the program to switch to (must be already open)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Confirmation that the active program was switched
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "programs/switch", {"name": name}))
+
+
 # Function tools
 @mcp.tool()
 @text_output
-def functions_list(offset: int = 0, limit: int = 100, 
-                  name_contains: str = None, 
+def functions_list(offset: int = 0, limit: int = 100,
+                  name_contains: str = None,
                   name_matches_regex: str = None,
+                  program: str = None,
                   port: int = None) -> dict:
     """List functions with filtering and pagination
-    
+
     Args:
         offset: Pagination offset (default: 0)
         limit: Maximum items to return (default: 100)
         name_contains: Substring name filter (case-insensitive)
         name_matches_regex: Regex name filter
+        program: Target a specific open program by name (multi-file support)
         port: Specific Ghidra instance port (optional)
-        
+
     Returns:
         dict: List of functions with pagination information
     """
     port = _get_instance_port(port)
-    
+
     params = {
         "offset": offset,
         "limit": limit
@@ -1962,7 +2059,7 @@ def functions_list(offset: int = 0, limit: int = 100,
     if name_matches_regex:
         params["name_matches_regex"] = name_matches_regex
 
-    response = safe_get(port, "functions", params)
+    response = safe_get(port, "functions", params, program=program)
     simplified = simplify_response(response)
     
     # Ensure we maintain pagination metadata
@@ -1975,14 +2072,15 @@ def functions_list(offset: int = 0, limit: int = 100,
 
 @mcp.tool()
 @text_output
-def functions_get(name: str = None, address: str = None, port: int = None) -> dict:
+def functions_get(name: str = None, address: str = None, program: str = None, port: int = None) -> dict:
     """Get detailed information about a function
-    
+
     Args:
         name: Function name (mutually exclusive with address)
         address: Function address in hex format (mutually exclusive with name)
+        program: Target a specific open program by name (multi-file support)
         port: Specific Ghidra instance port (optional)
-        
+
     Returns:
         dict: Detailed function information
     """
@@ -1995,15 +2093,15 @@ def functions_get(name: str = None, address: str = None, port: int = None) -> di
             },
             "timestamp": int(time.time() * 1000)
         }
-    
+
     port = _get_instance_port(port)
-    
+
     if address:
         endpoint = f"functions/{address}"
     else:
         endpoint = f"functions/by-name/{quote(name)}"
-    
-    response = safe_get(port, endpoint)
+
+    response = safe_get(port, endpoint, program=program)
     return simplify_response(response)
 
 @mcp.tool()
@@ -2012,7 +2110,7 @@ def functions_decompile(name: str = None, address: str = None,
                         syntax_tree: bool = False, style: str = "normalize",
                         show_constants: bool = True, timeout: int = 30,
                         start_line: int = None, end_line: int = None, max_lines: int = None,
-                        port: int = None) -> dict:
+                        program: str = None, port: int = None) -> dict:
     """Get decompiled code for a function with optional line filtering and configurable options
 
     Args:
@@ -2025,6 +2123,7 @@ def functions_decompile(name: str = None, address: str = None,
         start_line: Start at this line number (1-indexed, optional)
         end_line: End at this line number (inclusive, optional)
         max_lines: Maximum number of lines to return (optional, takes precedence over end_line)
+        program: Target a specific open program by name (multi-file support)
         port: Specific Ghidra instance port (optional)
 
     Returns:
@@ -2073,7 +2172,7 @@ def functions_decompile(name: str = None, address: str = None,
     else:
         endpoint = f"functions/by-name/{quote(name)}/decompile"
 
-    response = safe_get(port, endpoint, params)
+    response = safe_get(port, endpoint, params, program=program)
     simplified = simplify_response(response)
 
     return simplified
@@ -3403,6 +3502,309 @@ def datatypes_search(name: str, offset: int = 0, limit: int = 100, port: int = N
         simplified.setdefault("offset", offset)
         simplified.setdefault("limit", limit)
     return simplified
+
+
+# ================= Bookmark Tools =================
+
+@mcp.tool()
+@text_output
+def bookmarks_list(offset: int = 0, limit: int = 100, program: str = None, port: int = None) -> dict:
+    """List all bookmarks in the program
+
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum items to return (default: 100)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: List of bookmarks with address, type, category, and comment
+    """
+    port = _get_instance_port(port)
+    params = {"offset": offset, "limit": limit}
+    return simplify_response(safe_get(port, "bookmarks", params, program=program))
+
+
+@mcp.tool()
+@text_output
+def bookmarks_add(address: str, category: str = "", comment: str = "",
+                  bookmark_type: str = "Note", program: str = None, port: int = None) -> dict:
+    """Add a bookmark at an address
+
+    Args:
+        address: Address to bookmark (hex format)
+        category: Bookmark category (optional)
+        comment: Bookmark comment (optional)
+        bookmark_type: Bookmark type - Note, Warning, Error, etc. (default: Note)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Created bookmark information
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "bookmarks", {
+        "address": address,
+        "category": category,
+        "comment": comment,
+        "type": bookmark_type,
+    }, program=program))
+
+
+@mcp.tool()
+@text_output
+def bookmarks_delete(address: str, bookmark_type: str = "Note",
+                     program: str = None, port: int = None) -> dict:
+    """Delete a bookmark at an address
+
+    Args:
+        address: Address of the bookmark (hex format)
+        bookmark_type: Bookmark type to delete (default: Note)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Deletion confirmation
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "bookmarks/delete", {
+        "address": address,
+        "type": bookmark_type,
+    }, program=program))
+
+
+# ================= Memory Search Tools =================
+
+@mcp.tool()
+@text_output
+def memory_search_bytes(bytes_hex: str, offset: int = 0, limit: int = 20,
+                        program: str = None, port: int = None) -> dict:
+    """Search program memory for a byte pattern
+
+    Args:
+        bytes_hex: Hex string to search for (e.g. "4D5A9000" for MZ header)
+        offset: Result pagination offset (default: 0)
+        limit: Maximum results to return (default: 20)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: List of matching addresses
+    """
+    port = _get_instance_port(port)
+    params = {"bytes": bytes_hex, "offset": offset, "limit": limit}
+    return simplify_response(safe_get(port, "memory/search", params, program=program))
+
+
+# ================= Batch Operation Tools =================
+
+@mcp.tool()
+@text_output
+def batch_rename_functions(renames: list, program: str = None, port: int = None) -> dict:
+    """Batch rename multiple functions in a single transaction
+
+    Args:
+        renames: List of rename objects, each with 'old_name' or 'address' and 'new_name'.
+                 Example: [{"old_name": "FUN_001000", "new_name": "main"}, ...]
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Results of the batch rename operation
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "batch/rename-functions", {
+        "renames": renames,
+    }, program=program))
+
+
+@mcp.tool()
+@text_output
+def batch_set_comments(comments: list, comment_type: str = "eol",
+                       program: str = None, port: int = None) -> dict:
+    """Batch set comments at multiple addresses in a single transaction
+
+    Args:
+        comments: List of comment objects, each with 'address' and 'comment'.
+                  Example: [{"address": "0x1000", "comment": "entry point"}, ...]
+        comment_type: Comment type for all comments - plate/pre/post/eol/repeatable (default: eol)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Results of the batch comment operation
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "batch/set-comments", {
+        "comments": comments,
+        "type": comment_type,
+    }, program=program))
+
+
+@mcp.tool()
+@text_output
+def batch_define_data(items: list, program: str = None, port: int = None) -> dict:
+    """Batch define data items at multiple addresses in a single transaction
+
+    Args:
+        items: List of data definition objects, each with 'address', 'type', and optional 'label'.
+               Example: [{"address": "0x1000", "type": "dword", "label": "magic"}, ...]
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Results of the batch data definition operation
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "batch/define-data", {
+        "items": items,
+    }, program=program))
+
+
+# ================= Data Enhancement Tools =================
+
+@mcp.tool()
+@text_output
+def data_clear(address: str, size: int = 1, program: str = None, port: int = None) -> dict:
+    """Clear/undefine data at an address, reverting bytes to undefined
+
+    Args:
+        address: Address to clear (hex format)
+        size: Number of bytes to clear (default: 1)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Confirmation of the clear operation
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "data/clear", {
+        "address": address,
+        "size": size,
+    }, program=program))
+
+
+@mcp.tool()
+@text_output
+def data_create_label(address: str, name: str, program: str = None, port: int = None) -> dict:
+    """Create a label at an arbitrary address
+
+    Args:
+        address: Address to label (hex format)
+        name: Label name
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Created label information
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "data/label", {
+        "address": address,
+        "name": name,
+    }, program=program))
+
+
+@mcp.tool()
+@text_output
+def data_at_address(address: str, program: str = None, port: int = None) -> dict:
+    """Get detailed information about data defined at a specific address
+
+    Args:
+        address: Address to query (hex format)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Detailed data item information including type, value, size
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_get(port, f"data/at/{address}", program=program))
+
+
+@mcp.tool()
+@text_output
+def datatypes_apply(address: str, type_name: str, program: str = None, port: int = None) -> dict:
+    """Apply a data type at a memory address (e.g. stamp a struct)
+
+    Args:
+        address: Memory address to apply the type at (hex format)
+        type_name: Name of the data type to apply
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Result of the type application
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "datatypes/apply", {
+        "address": address,
+        "type_name": type_name,
+    }, program=program))
+
+
+# ================= Async Decompilation Tools =================
+
+@mcp.tool()
+@text_output
+def functions_decompile_async(name: str = None, address: str = None,
+                               timeout: int = 300, program: str = None,
+                               port: int = None) -> dict:
+    """Start asynchronous decompilation of a function (for large/complex functions)
+
+    Returns a task_id immediately. Use tasks_get_status() and tasks_get_result() to poll.
+
+    Args:
+        name: Function name (mutually exclusive with address)
+        address: Function address in hex format (mutually exclusive with name)
+        timeout: Decompilation timeout in seconds (default: 300)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Contains task_id for polling
+    """
+    port = _get_instance_port(port)
+    data = {"timeout": timeout}
+    if name:
+        data["name"] = name
+    if address:
+        data["address"] = address
+    return simplify_response(safe_post(port, "functions/decompile-async", data, program=program))
+
+
+@mcp.tool()
+@text_output
+def tasks_get_status(task_id: str, port: int = None) -> dict:
+    """Get the status of an async task
+
+    Args:
+        task_id: Task ID returned by an async operation
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Task status (pending/running/completed/failed)
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_get(port, f"tasks/{task_id}"))
+
+
+@mcp.tool()
+@text_output
+def tasks_get_result(task_id: str, port: int = None) -> dict:
+    """Get the result of a completed async task
+
+    The task is cleaned up after retrieving the result.
+
+    Args:
+        task_id: Task ID returned by an async operation
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Task result (e.g. decompiled code)
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_get(port, f"tasks/{task_id}/result"))
 
 
 # ================= Startup =================
