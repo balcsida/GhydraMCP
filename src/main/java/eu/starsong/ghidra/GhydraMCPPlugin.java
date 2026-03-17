@@ -140,6 +140,7 @@ public class GhydraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         Program currentProgram = getCurrentProgram();
         Msg.info(this, "Current program at registration time: " + (currentProgram != null ? currentProgram.getName() : "none"));
         
+        new AsyncEndpoints(currentProgram, port, tool, decompilerCache).registerEndpoints(server);
         new FunctionEndpoints(currentProgram, port, tool, decompilerCache).registerEndpoints(server);
         new VariableEndpoints(currentProgram, port, tool, decompilerCache).registerEndpoints(server);
         new ClassEndpoints(currentProgram, port, tool).registerEndpoints(server);
