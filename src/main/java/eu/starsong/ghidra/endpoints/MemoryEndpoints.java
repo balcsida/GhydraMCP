@@ -44,7 +44,10 @@ public class MemoryEndpoints extends AbstractEndpoint {
     public void registerEndpoints(HttpServer server) {
         // Per HttpServer docs: paths are matched by longest matching prefix
         // So register specific endpoints first, then more general ones
-        
+
+        // Search endpoint
+        server.createContext("/memory/search", this::handleMemorySearchRequest);
+
         // Comments endpoint path needs to be registered with a specific context path
         // Example: /memory/0x1000/comments/plate needs a specific handler
         server.createContext("/memory/", exchange -> {
@@ -58,7 +61,7 @@ public class MemoryEndpoints extends AbstractEndpoint {
                 handleMemoryAddressRequest(exchange);
             }
         });
-        
+
         // Register the most general endpoint last
         server.createContext("/memory", this::handleMemoryRequest);
     }
@@ -474,6 +477,120 @@ private void handleDisassemblyAtAddress(HttpExchange exchange, String addressStr
 
         } catch (Exception e) {
             Msg.error(this, "Error in disassembly at address endpoint", e);
+            sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage(), "INTERNAL_ERROR");
+        }
+    }
+
+    private void handleMemorySearchRequest(HttpExchange exchange) throws IOException {
+        try {
+            if (!"GET".equals(exchange.getRequestMethod())) {
+                sendErrorResponse(exchange, 405, "Method Not Allowed", "METHOD_NOT_ALLOWED");
+                return;
+            }
+
+            Program program = getProgram(exchange);
+            if (program == null) {
+                sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
+                return;
+            }
+
+            Map<String, String> params = parseQueryParams(exchange);
+            String bytesHex = params.get("bytes");
+            if (bytesHex == null || bytesHex.isEmpty()) {
+                sendErrorResponse(exchange, 400, "bytes parameter is required (hex string, e.g. 4D5A)", "MISSING_PARAMETER");
+                return;
+            }
+
+            // Strip optional spaces and validate hex string
+            bytesHex = bytesHex.replaceAll("\\s+", "");
+            if (bytesHex.length() % 2 != 0 || !bytesHex.matches("[0-9A-Fa-f]+")) {
+                sendErrorResponse(exchange, 400, "Invalid hex string: must be even-length hex characters", "INVALID_PARAMETER");
+                return;
+            }
+
+            // Parse hex string to byte array
+            byte[] pattern = new byte[bytesHex.length() / 2];
+            for (int i = 0; i < pattern.length; i++) {
+                pattern[i] = (byte) Integer.parseInt(bytesHex.substring(i * 2, i * 2 + 2), 16);
+            }
+
+            int offset = parseIntOrDefault(params.get("offset"), 0);
+            int limit = parseIntOrDefault(params.get("limit"), 20);
+
+            Memory memory = program.getMemory();
+            List<Map<String, Object>> matches = new ArrayList<>();
+            int found = 0;
+            int skipped = 0;
+
+            for (MemoryBlock block : memory.getBlocks()) {
+                if (!block.isInitialized()) {
+                    continue;
+                }
+
+                long blockSize = block.getSize();
+                Address blockStart = block.getStart();
+                int chunkSize = 4096;
+
+                for (long pos = 0; pos < blockSize && matches.size() < limit; pos += chunkSize) {
+                    int readLen = (int) Math.min(chunkSize + pattern.length - 1, blockSize - pos);
+                    byte[] chunk = new byte[readLen];
+                    try {
+                        int bytesRead = memory.getBytes(blockStart.add(pos), chunk, 0, readLen);
+                        // Search for pattern in chunk
+                        int searchEnd = bytesRead - pattern.length;
+                        for (int i = 0; i <= searchEnd; i++) {
+                            boolean match = true;
+                            for (int j = 0; j < pattern.length; j++) {
+                                if (chunk[i + j] != pattern[j]) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) {
+                                if (skipped < offset) {
+                                    skipped++;
+                                } else if (matches.size() < limit) {
+                                    Map<String, Object> m = new HashMap<>();
+                                    m.put("address", blockStart.add(pos + i).toString());
+                                    m.put("block", block.getName());
+                                    matches.add(m);
+                                }
+                                found++;
+                                if (matches.size() >= limit && skipped >= offset) {
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (MemoryAccessException e) {
+                        // Skip inaccessible regions
+                    }
+                }
+
+                if (matches.size() >= limit) {
+                    break;
+                }
+            }
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("pattern", bytesHex.toUpperCase());
+            result.put("matches", matches);
+            result.put("matchCount", matches.size());
+
+            ResponseBuilder builder = new ResponseBuilder(exchange, port)
+                .success(true)
+                .result(result)
+                .addLink("self", "/memory/search?bytes=" + bytesHex + "&offset=" + offset + "&limit=" + limit)
+                .addLink("memory", "/memory")
+                .addLink("blocks", "/memory/blocks");
+
+            if (matches.size() >= limit) {
+                builder.addLink("next", "/memory/search?bytes=" + bytesHex + "&offset=" + (offset + limit) + "&limit=" + limit);
+            }
+
+            sendJsonResponse(exchange, builder.build(), 200);
+
+        } catch (Exception e) {
+            Msg.error(this, "Error in /memory/search endpoint", e);
             sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage(), "INTERNAL_ERROR");
         }
     }
