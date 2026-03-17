@@ -93,7 +93,7 @@ public class GhydraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      * Starts the HTTP server and registers all endpoints
      */
     private void startServer() throws IOException {
-        server = HttpServer.create(new InetSocketAddress(port), 0);
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
         
         // Use a cached thread pool with larger stack size to handle deep B-tree
         // traversals in Ghidra's database (large binaries have deep index trees)
