@@ -85,6 +85,7 @@ def cli(ctx, host, port, output_json, no_color, verbose):
 # Import and register command groups
 from . import (
     instances,
+    programs,
     functions,
     memory,
     data,
@@ -103,6 +104,7 @@ from . import (
 )
 
 cli.add_command(instances.instances)
+cli.add_command(programs.programs)
 cli.add_command(functions.functions)
 cli.add_command(memory.memory)
 cli.add_command(data.data)
