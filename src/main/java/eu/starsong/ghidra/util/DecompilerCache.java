@@ -171,6 +171,7 @@ public class DecompilerCache implements DomainObjectListener {
         decompiler = new DecompInterface();
         DecompileOptions options = new DecompileOptions();
         options.setEliminateUnreachable(true);
+        options.setRespectReadOnly(true);
         options.grabFromProgram(program);
         decompiler.setOptions(options);
         decompiler.openProgram(program);
