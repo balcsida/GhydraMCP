@@ -414,9 +414,9 @@ public class FunctionEndpoints extends AbstractEndpoint {
                 TransactionHelper.executeInTransaction(program, "Rename function to " + newName, () -> {
                     if (newName.contains("::")) {
                         // Namespace-aware renaming: parse FQN and create namespace hierarchy
-                        ghidra.program.model.symbol.SymbolPath symbolPath = new ghidra.program.model.symbol.SymbolPath(newName);
+                        ghidra.app.util.SymbolPath symbolPath = new ghidra.app.util.SymbolPath(newName);
                         String leafName = symbolPath.getName();
-                        ghidra.program.model.symbol.SymbolPath parentPath = symbolPath.getParent();
+                        ghidra.app.util.SymbolPath parentPath = symbolPath.getParent();
                         if (parentPath != null) {
                             ghidra.program.model.symbol.Namespace ns =
                                 ghidra.app.util.NamespaceUtils.createNamespaceHierarchy(
@@ -931,9 +931,9 @@ public class FunctionEndpoints extends AbstractEndpoint {
                 TransactionHelper.executeInTransaction(program, "Rename function to " + newName, () -> {
                     if (newName.contains("::")) {
                         // Namespace-aware renaming: parse FQN and create namespace hierarchy
-                        ghidra.program.model.symbol.SymbolPath symbolPath = new ghidra.program.model.symbol.SymbolPath(newName);
+                        ghidra.app.util.SymbolPath symbolPath = new ghidra.app.util.SymbolPath(newName);
                         String leafName = symbolPath.getName();
-                        ghidra.program.model.symbol.SymbolPath parentPath = symbolPath.getParent();
+                        ghidra.app.util.SymbolPath parentPath = symbolPath.getParent();
                         if (parentPath != null) {
                             ghidra.program.model.symbol.Namespace ns =
                                 ghidra.app.util.NamespaceUtils.createNamespaceHierarchy(

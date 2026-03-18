@@ -47,7 +47,7 @@ public class GhidraUtil {
         if (program == null || name == null) return null;
         // Try FQN lookup first using SymbolPath
         try {
-            ghidra.program.model.symbol.SymbolPath symbolPath = new ghidra.program.model.symbol.SymbolPath(name);
+            ghidra.app.util.SymbolPath symbolPath = new ghidra.app.util.SymbolPath(name);
             java.util.List<ghidra.program.model.symbol.Symbol> symbols =
                 ghidra.app.util.NamespaceUtils.getSymbols(symbolPath, program, false);
             for (ghidra.program.model.symbol.Symbol symbol : symbols) {
