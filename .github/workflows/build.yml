@@ -11,10 +11,6 @@ on:
 permissions:
   contents: write
 
-env:
-  GHIDRA_VERSION: "11.4.2"
-  GHIDRA_DATE: "20250826"
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,19 +27,36 @@ jobs:
         distribution: 'temurin'
         cache: maven
 
+    - name: Get latest Ghidra release
+      id: ghidra-release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        ASSET_NAME=$(gh api repos/NationalSecurityAgency/ghidra/releases/latest --jq '.assets[] | select(.name | endswith(".zip")) | .name' | head -1)
+        DOWNLOAD_URL=$(gh api repos/NationalSecurityAgency/ghidra/releases/latest --jq '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' | head -1)
+        # Extract version from filename like ghidra_12.0.4_PUBLIC_20260303.zip
+        GHIDRA_VERSION=$(echo "$ASSET_NAME" | sed -E 's/ghidra_([0-9.]+)_PUBLIC_.*/\1/')
+        echo "version=$GHIDRA_VERSION" >> "$GITHUB_OUTPUT"
+        echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+        echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+        # Use version as cache key
+        echo "Detected latest Ghidra: $GHIDRA_VERSION ($ASSET_NAME)"
+
     - name: Cache Ghidra
       id: cache-ghidra
       uses: actions/cache@v5
       with:
         path: /opt/ghidra
-        key: ghidra-${{ env.GHIDRA_VERSION }}-${{ env.GHIDRA_DATE }}
+        key: ghidra-${{ steps.ghidra-release.outputs.version }}
 
     - name: Download and install Ghidra
       if: steps.cache-ghidra.outputs.cache-hit != 'true'
       run: |
-        wget -q "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip" -O /tmp/ghidra.zip
+        wget -q "${{ steps.ghidra-release.outputs.download_url }}" -O /tmp/ghidra.zip
         unzip -q /tmp/ghidra.zip -d /opt
-        mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC /opt/ghidra
+        # The extracted folder name varies, find it dynamically
+        GHIDRA_DIR=$(find /opt -maxdepth 1 -name "ghidra_*" -type d | head -1)
+        mv "$GHIDRA_DIR" /opt/ghidra
 
     - name: Build with Maven
       env:
