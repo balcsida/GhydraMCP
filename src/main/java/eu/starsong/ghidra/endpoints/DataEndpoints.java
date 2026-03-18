@@ -230,6 +230,13 @@ package eu.starsong.ghidra.endpoints;
                     return;
                 }
                 
+                // Extract filter parameters
+                String addrFilter = qparams.get("addr");
+                String nameFilter = qparams.get("name");
+                String nameContainsFilter = qparams.get("name_contains");
+                String typeFilter = qparams.get("type");
+
+                SymbolTable symbolTable = program.getSymbolTable();
                 List<Map<String, Object>> dataItems = new ArrayList<>();
                 for (MemoryBlock block : program.getMemory().getBlocks()) {
                     DataIterator it = program.getListing().getDefinedData(block.getStart(), true);
@@ -237,17 +244,37 @@ package eu.starsong.ghidra.endpoints;
                         Data data = it.next();
                         if (block.contains(data.getAddress())) {
                             // Apply addr filter if present
-                            String addrFilter = qparams.get("addr");
                             if (addrFilter != null && !data.getAddress().toString().equals(addrFilter)) {
-                                continue; // Skip this data item if address doesn't match filter
+                                continue;
                             }
 
                             // Resolve name: prefer label, fall back to primary symbol FQN
                             String dataName = data.getLabel();
                             if (dataName == null) {
-                                Symbol sym = program.getSymbolTable().getPrimarySymbol(data.getAddress());
+                                Symbol sym = symbolTable.getPrimarySymbol(data.getAddress());
                                 if (sym != null) {
                                     dataName = sym.getName(true);
+                                }
+                            }
+
+                            // Apply name filter: exact match against FQN
+                            if (nameFilter != null) {
+                                if (dataName == null || !dataName.equals(nameFilter)) {
+                                    continue;
+                                }
+                            }
+
+                            // Apply name_contains filter: case-insensitive substring match
+                            if (nameContainsFilter != null) {
+                                if (dataName == null || !dataName.toLowerCase().contains(nameContainsFilter.toLowerCase())) {
+                                    continue;
+                                }
+                            }
+
+                            // Apply type filter: case-insensitive match against data type name
+                            if (typeFilter != null) {
+                                if (!data.getDataType().getName().equalsIgnoreCase(typeFilter)) {
+                                    continue;
                                 }
                             }
 
@@ -256,14 +283,14 @@ package eu.starsong.ghidra.endpoints;
                             item.put("name", dataName != null ? dataName : "(unnamed)");
                             item.put("value", data.getDefaultValueRepresentation());
                             item.put("dataType", data.getDataType().getName());
-                            
+
                             // Add HATEOAS links
                             Map<String, Object> links = new HashMap<>();
                             Map<String, String> selfLink = new HashMap<>();
                             selfLink.put("href", "/data/" + data.getAddress().toString());
                             links.put("self", selfLink);
                             item.put("_links", links);
-                            
+
                             dataItems.add(item);
                         }
                     }
