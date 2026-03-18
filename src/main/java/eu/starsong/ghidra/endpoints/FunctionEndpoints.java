@@ -1420,7 +1420,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
      * Helper method to find a function by name
      */
     private Function findFunctionByName(String name) {
-        Program program = getProgram(exchange);
+        Program program = getCurrentProgram();
         if (program == null) {
             return null;
         }
@@ -1435,7 +1435,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
     }
     
     private Function findFunctionByAddress(String addressString) {
-        Program program = getProgram(exchange);
+        Program program = getCurrentProgram();
         if (program == null) {
             return null;
         }
