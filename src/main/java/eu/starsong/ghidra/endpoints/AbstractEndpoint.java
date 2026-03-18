@@ -245,7 +245,7 @@ public abstract class AbstractEndpoint implements GhidraJsonEndpoint {
                     return symbol.getAddress().toString();
                 }
             }
-            return symbol.getName();
+            return symbol.getName(true);
         } catch (StackOverflowError e) {
             Msg.warn(this, "StackOverflow resolving symbol name at " + symbol.getAddress());
             return symbol.getAddress().toString();

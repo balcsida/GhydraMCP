@@ -242,9 +242,18 @@ package eu.starsong.ghidra.endpoints;
                                 continue; // Skip this data item if address doesn't match filter
                             }
 
+                            // Resolve name: prefer label, fall back to primary symbol FQN
+                            String dataName = data.getLabel();
+                            if (dataName == null) {
+                                Symbol sym = program.getSymbolTable().getPrimarySymbol(data.getAddress());
+                                if (sym != null) {
+                                    dataName = sym.getName(true);
+                                }
+                            }
+
                             Map<String, Object> item = new HashMap<>();
                             item.put("address", data.getAddress().toString());
-                            item.put("name", data.getLabel() != null ? data.getLabel() : "(unnamed)");
+                            item.put("name", dataName != null ? dataName : "(unnamed)");
                             item.put("value", data.getDefaultValueRepresentation());
                             item.put("dataType", data.getDataType().getName());
                             

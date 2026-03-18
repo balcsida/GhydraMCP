@@ -242,15 +242,15 @@ public class FunctionEndpoints extends AbstractEndpoint {
                 // Get all functions
                 for (Function f : program.getFunctionManager().getFunctions(true)) {
                     // Apply filters
-                    if (nameFilter != null && !f.getName().equals(nameFilter)) {
+                    if (nameFilter != null && !f.getName().equals(nameFilter) && !f.getName(true).equals(nameFilter)) {
                         continue;
                     }
                     
-                    if (nameContainsFilter != null && !f.getName().toLowerCase().contains(nameContainsFilter.toLowerCase())) {
+                    if (nameContainsFilter != null && !f.getName(true).toLowerCase().contains(nameContainsFilter.toLowerCase())) {
                         continue;
                     }
                     
-                    if (nameRegexFilter != null && !f.getName().matches(nameRegexFilter)) {
+                    if (nameRegexFilter != null && !f.getName(true).matches(nameRegexFilter)) {
                         continue;
                     }
                     
@@ -259,7 +259,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
                     }
                     
                     Map<String, Object> func = new HashMap<>();
-                    func.put("name", f.getName());
+                    func.put("name", f.getName(true));
                     func.put("address", f.getEntryPoint().toString());
                     
                     // Add HATEOAS links
@@ -412,7 +412,22 @@ public class FunctionEndpoints extends AbstractEndpoint {
             // Rename function
             try {
                 TransactionHelper.executeInTransaction(program, "Rename function to " + newName, () -> {
-                    function.setName(newName, ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                    if (newName.contains("::")) {
+                        // Namespace-aware renaming: parse FQN and create namespace hierarchy
+                        ghidra.program.model.symbol.SymbolPath symbolPath = new ghidra.program.model.symbol.SymbolPath(newName);
+                        String leafName = symbolPath.getName();
+                        ghidra.program.model.symbol.SymbolPath parentPath = symbolPath.getParent();
+                        if (parentPath != null) {
+                            ghidra.program.model.symbol.Namespace ns =
+                                ghidra.app.util.NamespaceUtils.createNamespaceHierarchy(
+                                    parentPath.getPath(), null, program,
+                                    ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                            function.setParentNamespace(ns);
+                        }
+                        function.setName(leafName, ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                    } else {
+                        function.setName(newName, ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                    }
                     return null;
                 });
                 changed = true;
@@ -595,15 +610,15 @@ public class FunctionEndpoints extends AbstractEndpoint {
                             // Apply other filters to the found function
                             boolean matches = true;
 
-                            if (nameFilter != null && !containingFunc.getName().equals(nameFilter)) {
+                            if (nameFilter != null && !containingFunc.getName().equals(nameFilter) && !containingFunc.getName(true).equals(nameFilter)) {
                                 matches = false;
                             }
 
-                            if (nameContainsFilter != null && !containingFunc.getName().toLowerCase().contains(nameContainsFilter.toLowerCase())) {
+                            if (nameContainsFilter != null && !containingFunc.getName(true).toLowerCase().contains(nameContainsFilter.toLowerCase())) {
                                 matches = false;
                             }
 
-                            if (nameRegexFilter != null && !containingFunc.getName().matches(nameRegexFilter)) {
+                            if (nameRegexFilter != null && !containingFunc.getName(true).matches(nameRegexFilter)) {
                                 matches = false;
                             }
 
@@ -613,7 +628,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
 
                             if (matches) {
                                 Map<String, Object> func = new HashMap<>();
-                                func.put("name", containingFunc.getName());
+                                func.put("name", containingFunc.getName(true));
                                 func.put("address", containingFunc.getEntryPoint().toString());
 
                                 // Add HATEOAS links (fixed to use proper URL paths)
@@ -639,15 +654,15 @@ public class FunctionEndpoints extends AbstractEndpoint {
                     // Get all functions
                     for (Function f : program.getFunctionManager().getFunctions(true)) {
                         // Apply filters
-                        if (nameFilter != null && !f.getName().equals(nameFilter)) {
+                        if (nameFilter != null && !f.getName().equals(nameFilter) && !f.getName(true).equals(nameFilter)) {
                             continue;
                         }
 
-                        if (nameContainsFilter != null && !f.getName().toLowerCase().contains(nameContainsFilter.toLowerCase())) {
+                        if (nameContainsFilter != null && !f.getName(true).toLowerCase().contains(nameContainsFilter.toLowerCase())) {
                             continue;
                         }
 
-                        if (nameRegexFilter != null && !f.getName().matches(nameRegexFilter)) {
+                        if (nameRegexFilter != null && !f.getName(true).matches(nameRegexFilter)) {
                             continue;
                         }
 
@@ -656,7 +671,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
                         }
 
                         Map<String, Object> func = new HashMap<>();
-                        func.put("name", f.getName());
+                        func.put("name", f.getName(true));
                         func.put("address", f.getEntryPoint().toString());
 
                         // Add HATEOAS links (fixed to use proper URL paths)
@@ -914,7 +929,22 @@ public class FunctionEndpoints extends AbstractEndpoint {
             // Rename function
             try {
                 TransactionHelper.executeInTransaction(program, "Rename function to " + newName, () -> {
-                    function.setName(newName, ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                    if (newName.contains("::")) {
+                        // Namespace-aware renaming: parse FQN and create namespace hierarchy
+                        ghidra.program.model.symbol.SymbolPath symbolPath = new ghidra.program.model.symbol.SymbolPath(newName);
+                        String leafName = symbolPath.getName();
+                        ghidra.program.model.symbol.SymbolPath parentPath = symbolPath.getParent();
+                        if (parentPath != null) {
+                            ghidra.program.model.symbol.Namespace ns =
+                                ghidra.app.util.NamespaceUtils.createNamespaceHierarchy(
+                                    parentPath.getPath(), null, program,
+                                    ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                            function.setParentNamespace(ns);
+                        }
+                        function.setName(leafName, ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                    } else {
+                        function.setName(newName, ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                    }
                     return null;
                 });
                 changed = true;
@@ -1114,7 +1144,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
             // Create function info
             Map<String, Object> functionInfo = new HashMap<>();
             functionInfo.put("address", function.getEntryPoint().toString());
-            functionInfo.put("name", function.getName());
+            functionInfo.put("name", function.getName(true));
 
             // Create the result structure according to GHIDRA_HTTP_API.md
             Map<String, Object> result = new HashMap<>();
@@ -1227,7 +1257,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
 
             Map<String, Object> functionInfo = new HashMap<>();
             functionInfo.put("address", function.getEntryPoint().toString());
-            functionInfo.put("name", function.getName());
+            functionInfo.put("name", function.getName(true));
             functionInfo.put("signature", function.getSignature().toString());
 
             Map<String, Object> result = new HashMap<>();
@@ -1285,7 +1315,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
             
             Map<String, Object> functionInfo = new HashMap<>();
             functionInfo.put("address", function.getEntryPoint().toString());
-            functionInfo.put("name", function.getName());
+            functionInfo.put("name", function.getName(true));
             if (function.getReturnType() != null) {
                 functionInfo.put("returnType", function.getReturnType().getName());
             }
@@ -1421,17 +1451,7 @@ public class FunctionEndpoints extends AbstractEndpoint {
      */
     private Function findFunctionByName(String name) {
         Program program = getCurrentProgram();
-        if (program == null) {
-            return null;
-        }
-        
-        for (Function f : program.getFunctionManager().getFunctions(true)) {
-            if (f.getName().equals(name)) {
-                return f;
-            }
-        }
-        
-        return null;
+        return GhidraUtil.findFunctionByName(program, name);
     }
     
     private Function findFunctionByAddress(String addressString) {

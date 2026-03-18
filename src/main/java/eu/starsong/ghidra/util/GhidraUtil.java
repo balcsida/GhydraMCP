@@ -35,6 +35,39 @@ import java.util.Map;
 public class GhidraUtil {
 
     /**
+     * Finds a function by name using FQN-aware lookup.
+     * Tries SymbolPath-based lookup first for fully-qualified names (e.g. "Namespace::funcName"),
+     * then falls back to simple name iteration.
+     *
+     * @param program The current program.
+     * @param name The function name (simple or fully-qualified).
+     * @return The found Function, or null if not found.
+     */
+    public static Function findFunctionByName(Program program, String name) {
+        if (program == null || name == null) return null;
+        // Try FQN lookup first using SymbolPath
+        try {
+            ghidra.program.model.symbol.SymbolPath symbolPath = new ghidra.program.model.symbol.SymbolPath(name);
+            java.util.List<ghidra.program.model.symbol.Symbol> symbols =
+                ghidra.app.util.NamespaceUtils.getSymbols(symbolPath, program, false);
+            for (ghidra.program.model.symbol.Symbol symbol : symbols) {
+                if (symbol.getSymbolType() == ghidra.program.model.symbol.SymbolType.FUNCTION) {
+                    return (Function) symbol.getObject();
+                }
+            }
+        } catch (Exception e) {
+            // Fall through to simple lookup
+        }
+        // Fallback: simple name iteration
+        for (Function f : program.getFunctionManager().getFunctions(true)) {
+            if (f.getName().equals(name) || f.getName(true).equals(name)) {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Parse an integer from a string, or return defaultValue if null/invalid.
      */
     public static int parseIntOrDefault(String val, int defaultValue) {
@@ -284,14 +317,9 @@ public class GhidraUtil {
             Msg.debug(GhidraUtil.class, "Could not interpret as address: " + addressOrName);
         }
         
-        // If not found by address, try by name
+        // If not found by address, try by name (FQN-aware)
         if (function == null) {
-            for (Function f : program.getFunctionManager().getFunctions(true)) {
-                if (f.getName().equals(addressOrName)) {
-                    function = f;
-                    break;
-                }
-            }
+            function = findFunctionByName(program, addressOrName);
         }
         
         if (function == null) {
