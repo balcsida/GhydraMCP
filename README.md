@@ -28,7 +28,7 @@ This architecture enables AI assistants like Claude to seamlessly:
 - Navigate resources through discoverable HATEOAS links
 - Work with multiple open programs in the same Ghidra instance
 
-GhydraMCP is based on [GhidraMCP by Laurie Wired](https://github.com/LaurieWired/GhidraMCP/) and incorporates features from community PRs, with enhanced multi-instance/multi-file support, batch operations, async decompilation, and a robust HATEOAS-compliant API architecture.
+GhydraMCP is based on [GhidraMCP by Laurie Wired](https://github.com/LaurieWired/GhidraMCP/), with the modular HATEOAS API architecture, CLI tool, and MCP bridge originally developed by [Starsong Consulting](https://github.com/starsong-consulting/GhydraMCP). This fork adds multi-file support, batch operations, async decompilation, and features from upstream community PRs.
 
 ## What's New in v2.3.0
 
@@ -230,4 +230,6 @@ Apache License 2.0 - see [LICENSE](LICENSE) for details.
 
 # Credits
 
-Based on [GhidraMCP by Laurie Wired](https://github.com/LaurieWired/GhidraMCP/). Incorporates ideas and features from community contributors and PRs.
+- [GhidraMCP by Laurie Wired](https://github.com/LaurieWired/GhidraMCP/) — the original Ghidra MCP plugin
+- [Starsong Consulting](https://github.com/starsong-consulting/GhydraMCP) — modular HATEOAS API architecture, CLI tool (`ghydra`), MCP bridge rewrite, multi-instance support, struct/data type management, and the overall GhydraMCP platform
+- Community contributors to the upstream GhidraMCP PRs that inspired features in this release
