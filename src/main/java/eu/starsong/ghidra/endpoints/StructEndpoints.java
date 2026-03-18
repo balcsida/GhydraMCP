@@ -704,6 +704,7 @@ public class StructEndpoints extends AbstractEndpoint {
      * POST /structs/delete
      * Required params: name
      */
+    @SuppressWarnings("removal")
     private void handleDeleteStruct(HttpExchange exchange, Map<String, String> params) throws IOException {
         try {
             String structName = params.get("name");
@@ -750,7 +751,7 @@ public class StructEndpoints extends AbstractEndpoint {
                     resultMap.put("category", dataType.getCategoryPath().getPath());
 
                     // Remove the struct
-                    dtm.remove(dataType, null);
+                    dtm.remove(dataType, ghidra.util.task.TaskMonitor.DUMMY);
 
                     return null;
                 });

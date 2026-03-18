@@ -6,9 +6,9 @@
   <groupId>eu.starsong.ghidra</groupId>
   <artifactId>GhydraMCP</artifactId>
   <packaging>jar</packaging>
-  <version>2.2.0</version>
+  <version>2.3.0</version>
   <name>GhydraMCP</name>
-  <url>https://github.com/starsong-consulting/GhydraMCP</url>
+  <url>https://github.com/balcsida/GhydraMCP</url>
   
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -25,7 +25,7 @@
     <maven.install.skip>true</maven.install.skip>
     <maven.build.timestamp.format>yyyyMMdd-HHmmss</maven.build.timestamp.format>
     <revision>dev</revision>
-    <inner.zip.filename>GhydraMCP-${git.commit.id.describe}-${maven.build.timestamp}.zip</inner.zip.filename>
+    <inner.zip.filename>GhydraMCP-${git.commit.id.describe}-${maven.build.timestamp}-plugin.zip</inner.zip.filename>
   </properties>
 
   <dependencies>
@@ -99,6 +99,7 @@
   </dependencies>
 
   <build>
+    <finalName>GhydraMCP-${git.commit.id.describe}-${maven.build.timestamp}</finalName>
     <resources>
       <resource>
         <directory>src/main/resources</directory>
@@ -114,7 +115,10 @@
         <configuration>
           <source>21</source>
           <target>21</target>
-          <compilerArgument>-Xlint:-path</compilerArgument>
+          <compilerArgs>
+            <arg>-Xlint:-path</arg>
+            <arg>-Xlint:-deprecation</arg>
+          </compilerArgs>
         </configuration>
       </plugin>
       
@@ -162,7 +166,6 @@
               <Plugin-Description>Expose multiple Ghidra tools to MCP servers with variable management</Plugin-Description>
             </manifestEntries>
           </archive>
-          <finalName>GhydraMCP</finalName>
           <excludes>
             <exclude>**/App.class</exclude>
           </excludes>
@@ -187,8 +190,7 @@
               <descriptors>
                 <descriptor>src/assembly/ghidra-extension.xml</descriptor>
               </descriptors>
-              <finalName>GhydraMCP-${git.commit.id.describe}-${maven.build.timestamp}</finalName>
-              <appendAssemblyId>false</appendAssemblyId>
+              <appendAssemblyId>true</appendAssemblyId>
             </configuration>
           </execution>
           
@@ -203,8 +205,7 @@
               <descriptors>
                 <descriptor>src/assembly/complete-package.xml</descriptor>
               </descriptors>
-              <finalName>GhydraMCP-Complete-${git.commit.id.describe}-${maven.build.timestamp}</finalName>
-              <appendAssemblyId>false</appendAssemblyId>
+              <appendAssemblyId>true</appendAssemblyId>
             </configuration>
           </execution>
         </executions>
@@ -229,30 +230,7 @@
             </configuration>
           </execution>
           
-          <!-- Validate system dependency paths -->
-          <execution>
-            <id>validate-system-dependencies</id>
-            <phase>validate</phase>
-            <goals>
-              <goal>analyze-only</goal>
-            </goals>
-            <configuration>
-              <failOnWarning>false</failOnWarning>
-              <ignoredUnusedDeclaredDependencies>
-                <ignoredUnusedDeclaredDependency>ghidra:Generic</ignoredUnusedDeclaredDependency>
-                <ignoredUnusedDeclaredDependency>ghidra:SoftwareModeling</ignoredUnusedDeclaredDependency>
-                <ignoredUnusedDeclaredDependency>ghidra:Project</ignoredUnusedDeclaredDependency>
-                <ignoredUnusedDeclaredDependency>ghidra:Docking</ignoredUnusedDeclaredDependency>
-                <ignoredUnusedDeclaredDependency>ghidra:Decompiler</ignoredUnusedDeclaredDependency>
-                <ignoredUnusedDeclaredDependency>ghidra:Utility</ignoredUnusedDeclaredDependency>
-                <ignoredUnusedDeclaredDependency>ghidra:Base</ignoredUnusedDeclaredDependency>
-                <ignoredUnusedDeclaredDependency>junit:junit</ignoredUnusedDeclaredDependency>
-              </ignoredUnusedDeclaredDependencies>
-              <ignoredSystemDependencies>
-                <ignoredSystemDependency>ghidra:*</ignoredSystemDependency>
-              </ignoredSystemDependencies>
-            </configuration>
-          </execution>
+          <!-- Note: system-scoped Ghidra dependencies are validated at compile time -->
         </executions>
       </plugin>
     </plugins>
