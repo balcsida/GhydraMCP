@@ -157,6 +157,7 @@ public class GhydraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         new BookmarkEndpoints(currentProgram, port, tool).registerEndpoints(server);
         new BatchEndpoints(currentProgram, port, tool).registerEndpoints(server);
         new DataTypeEndpoints(currentProgram, port, tool).registerEndpoints(server);
+        new ScalarEndpoints(currentProgram, port, tool).registerEndpoints(server);
 
         Msg.info(this, "Registered program-dependent endpoints. Programs will be checked at runtime.");
     }
@@ -399,6 +400,7 @@ public class GhydraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                            .addLink("bookmarks", "/bookmarks")
                            .addLink("datatypes", "/datatypes")
                            .addLink("batch", "/batch")
+                           .addLink("scalars", "/scalars")
                            .addLink("open_programs", "/programs/open-programs");
                 }
                 

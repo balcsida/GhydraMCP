@@ -3596,6 +3596,33 @@ def memory_search_bytes(bytes_hex: str, offset: int = 0, limit: int = 20,
     return simplify_response(safe_get(port, "memory/search", params, program=program))
 
 
+# ================= Scalar Search Tools =================
+
+@mcp.tool()
+@text_output
+def scalars_search(value: str, in_function: str = None, to_function: str = None,
+                   offset: int = 0, limit: int = 100, program: str = None, port: int = None) -> dict:
+    """Search for scalar (constant) values in program instructions
+
+    Args:
+        value: Scalar value to search for (hex with 0x prefix or decimal)
+        in_function: Filter to scalars within this function (case-insensitive substring)
+        to_function: Filter to scalars passed as arguments to this function (case-insensitive substring)
+        offset: Pagination offset
+        limit: Maximum results
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Matching scalar locations with context
+    """
+    port = _get_instance_port(port)
+    params = {"value": value, "offset": offset, "limit": limit}
+    if in_function: params["in_function"] = in_function
+    if to_function: params["to_function"] = to_function
+    return simplify_response(safe_get(port, "scalars", params, program=program))
+
+
 # ================= Batch Operation Tools =================
 
 @mcp.tool()
