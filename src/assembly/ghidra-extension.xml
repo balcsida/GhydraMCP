@@ -11,9 +11,9 @@
     <includeBaseDirectory>false</includeBaseDirectory>
     
     <fileSets>
-        <!-- Copy extension files to GhydraMCP/ directory -->
+        <!-- Copy extension files from build output (filtered by Maven) -->
         <fileSet>
-            <directory>src/main/resources</directory>
+            <directory>${project.build.outputDirectory}</directory>
             <includes>
                 <include>extension.properties</include>
                 <include>Module.manifest</include>
