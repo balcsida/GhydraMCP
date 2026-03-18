@@ -35,7 +35,7 @@ FULL_DISCOVERY_RANGE = range(DEFAULT_GHIDRA_PORT, DEFAULT_GHIDRA_PORT+20)
 BRIDGE_VERSION = "v2.3.0"
 REQUIRED_API_VERSION = 2030
 
-DEFAULT_TIMEOUT = int(os.environ.get("GHIDRA_TIMEOUT", "10"))
+DEFAULT_TIMEOUT = int(os.environ.get("GHIDRA_TIMEOUT", "30"))
 
 current_instance_port = DEFAULT_GHIDRA_PORT
 
@@ -77,7 +77,7 @@ mcp = FastMCP("GhydraMCP", version=BRIDGE_VERSION, instructions=instructions)
 ghidra_host = os.environ.get("GHIDRA_HYDRA_HOST", DEFAULT_GHIDRA_HOST)
 
 # Helper function to get the current instance or validate a specific port
-def _get_instance_port(port=None):
+def _get_instance_port(port: Optional[int] = None) -> int:
     """Internal helper to get the current instance port or validate a specific port"""
     port = port or current_instance_port
     # Validate that the instance exists and is active
@@ -1017,7 +1017,7 @@ def simplify_response(response: dict) -> dict:
     
     return result
 
-def register_instance(port: int, url: str = None) -> str:
+def register_instance(port: int, url: Optional[str] = None) -> str:
     """Register a new Ghidra instance
     
     Args:
@@ -1110,7 +1110,7 @@ def register_instance(port: int, url: str = None) -> str:
     except Exception as e:
         return f"Error: Could not connect to instance at {url}: {str(e)}"
 
-def _discover_instances(port_range, host=None, timeout=0.5) -> dict:
+def _discover_instances(port_range: range, host: Optional[str] = None, timeout: float = 0.5) -> dict:
     """Internal function to discover NEW Ghidra instances by scanning ports
 
     This function only returns newly discovered instances that weren't already
@@ -1178,7 +1178,7 @@ def _discover_instances(port_range, host=None, timeout=0.5) -> dict:
         "instances": found_instances
     }
 
-def periodic_discovery():
+def periodic_discovery() -> None:
     """Periodically discover new instances"""
     while True:
         try:
@@ -1239,7 +1239,7 @@ def periodic_discovery():
 
         time.sleep(30)
 
-def handle_sigint(signum, frame):
+def handle_sigint(signum: int, frame: Any) -> None:
     os._exit(0)
 
 # ================= MCP Resources =================
@@ -2099,6 +2099,7 @@ def functions_get(name: str = None, address: str = None, program: str = None, po
     if address:
         endpoint = f"functions/{address}"
     else:
+        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}"
 
     response = safe_get(port, endpoint, program=program)
@@ -2170,6 +2171,7 @@ def functions_decompile(name: str = None, address: str = None,
     if address:
         endpoint = f"functions/{address}/decompile"
     else:
+        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}/decompile"
 
     response = safe_get(port, endpoint, params, program=program)
@@ -2207,9 +2209,10 @@ def functions_disassemble(name: str = None, address: str = None, offset: int = 0
     if address:
         endpoint = f"functions/{address}/disassembly"
     else:
+        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}/disassembly"
 
-    params = {}
+    params: Dict[str, Any] = {}
     if offset > 0:
         params["offset"] = offset
     if limit > 0:
@@ -2282,8 +2285,9 @@ def functions_rename(old_name: str = None, address: str = None, new_name: str = 
     if address:
         endpoint = f"functions/{address}"
     else:
+        assert old_name is not None
         endpoint = f"functions/by-name/{quote(old_name)}"
-    
+
     response = safe_patch(port, endpoint, payload)
     return simplify_response(response)
 
@@ -2320,8 +2324,9 @@ def functions_set_signature(name: str = None, address: str = None, signature: st
     if address:
         endpoint = f"functions/{address}"
     else:
+        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}"
-    
+
     response = safe_patch(port, endpoint, payload)
     return simplify_response(response)
 
@@ -2353,8 +2358,9 @@ def functions_get_variables(name: str = None, address: str = None, port: int = N
     if address:
         endpoint = f"functions/{address}/variables"
     else:
+        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}/variables"
-    
+
     response = safe_get(port, endpoint)
     return simplify_response(response)
 
@@ -3836,7 +3842,7 @@ def tasks_get_result(task_id: str, port: int = None) -> dict:
 
 # ================= Startup =================
 
-def main():
+def main() -> None:
     register_instance(DEFAULT_GHIDRA_PORT,
                       f"http://{ghidra_host}:{DEFAULT_GHIDRA_PORT}")
 
