@@ -14,6 +14,7 @@ import signal
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Dict, List, Optional, Union, Any
 from urllib.parse import quote, urlencode, urlparse
@@ -38,6 +39,10 @@ BRIDGE_VERSION = "v2.3.0"
 REQUIRED_API_VERSION = 2030
 
 DEFAULT_TIMEOUT = int(os.environ.get("GHIDRA_TIMEOUT", "30"))
+
+# Discovery cache: avoid re-scanning if recently completed
+_last_discovery_time: float = 0.0
+_DISCOVERY_CACHE_TTL: float = 5.0  # seconds
 
 current_instance_port = DEFAULT_GHIDRA_PORT
 
@@ -1112,130 +1117,151 @@ def register_instance(port: int, url: Optional[str] = None) -> str:
     except Exception as e:
         return f"Error: Could not connect to instance at {url}: {str(e)}"
 
-def _discover_instances(port_range: range, host: Optional[str] = None, timeout: float = 0.5) -> dict:
-    """Internal function to discover NEW Ghidra instances by scanning ports
+def _probe_port(port: int, scan_host: str, timeout: float) -> Optional[dict]:
+    """Probe a single port for a Ghidra instance. Returns instance info or None."""
+    url = f"http://{scan_host}:{port}"
+    try:
+        test_url = f"{url}/plugin-version"
+        response = requests.get(test_url,
+                              headers={'Accept': 'application/json',
+                                       'X-Request-ID': f"discovery-{int(time.time() * 1000)}"},
+                              timeout=timeout)
+
+        if not response.ok:
+            return None
+
+        json_data = response.json()
+        if not ("success" in json_data and json_data["success"] and "result" in json_data):
+            return None
+
+        result = register_instance(port, url)
+
+        instance_info: dict = {"port": port, "url": url}
+
+        if isinstance(json_data["result"], dict):
+            instance_info["plugin_version"] = json_data["result"].get("plugin_version", "unknown")
+            instance_info["api_version"] = json_data["result"].get("api_version", "unknown")
+        else:
+            instance_info["plugin_version"] = "unknown"
+            instance_info["api_version"] = "unknown"
+
+        if port in active_instances:
+            instance_info["project"] = active_instances[port].get("project", "")
+            instance_info["file"] = active_instances[port].get("file", "")
+
+        instance_info["result"] = result
+        return instance_info
+
+    except (requests.exceptions.RequestException, ValueError, KeyError):
+        return None
+
+
+def _discover_instances(port_range: range, host: Optional[str] = None, timeout: float = 0.3) -> dict:
+    """Internal function to discover NEW Ghidra instances by scanning ports in parallel.
 
     This function only returns newly discovered instances that weren't already
     in the active_instances registry. Use instances_discover() for a complete
     list including already known instances.
     """
-    found_instances = []
+    global _last_discovery_time
+
+    # Skip if we discovered recently (cache TTL)
+    now = time.monotonic()
+    if now - _last_discovery_time < _DISCOVERY_CACHE_TTL:
+        return {"found": 0, "instances": []}
+
     scan_host = host if host is not None else ghidra_host
+    ports_to_scan = [p for p in port_range if p not in active_instances]
 
-    for port in port_range:
-        if port in active_instances:
-            continue  # Skip already known instances
+    if not ports_to_scan:
+        _last_discovery_time = now
+        return {"found": 0, "instances": []}
 
-        url = f"http://{scan_host}:{port}"
-        try:
-            # Try HATEOAS API via plugin-version endpoint
-            test_url = f"{url}/plugin-version"
-            response = requests.get(test_url, 
-                                  headers={'Accept': 'application/json', 
-                                           'X-Request-ID': f"discovery-{int(time.time() * 1000)}"},
-                                  timeout=timeout)
-            
-            if response.ok:
-                # Further validate it's a GhydraMCP instance by checking response format
-                try:
-                    json_data = response.json()
-                    if "success" in json_data and json_data["success"] and "result" in json_data:
-                        # Looks like a valid HATEOAS API response
-                        # Instead of relying only on register_instance, which already checks program info,
-                        # extract additional information here for more detailed discovery results
-                        result = register_instance(port, url)
-                        
-                        # Initialize report info
-                        instance_info = {
-                            "port": port, 
-                            "url": url
-                        }
-                        
-                        # Extract version info for reporting
-                        if isinstance(json_data["result"], dict):
-                            instance_info["plugin_version"] = json_data["result"].get("plugin_version", "unknown")
-                            instance_info["api_version"] = json_data["result"].get("api_version", "unknown")
-                        else:
-                            instance_info["plugin_version"] = "unknown"
-                            instance_info["api_version"] = "unknown"
-                        
-                        # Include project details from registered instance in the report
-                        if port in active_instances:
-                            instance_info["project"] = active_instances[port].get("project", "")
-                            instance_info["file"] = active_instances[port].get("file", "")
-                        
-                        instance_info["result"] = result
-                        found_instances.append(instance_info)
-                except (ValueError, KeyError):
-                    # Not a valid JSON response or missing expected keys
-                    print(f"Port {port} returned non-HATEOAS response", file=sys.stderr)
-                    continue
-            
-        except requests.exceptions.RequestException:
-            # Instance not available, just continue
-            continue
+    found_instances: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=min(len(ports_to_scan), 10)) as executor:
+        futures = {
+            executor.submit(_probe_port, port, scan_host, timeout): port
+            for port in ports_to_scan
+        }
+        for future in as_completed(futures):
+            info = future.result()
+            if info is not None:
+                found_instances.append(info)
+
+    _last_discovery_time = time.monotonic()
 
     return {
         "found": len(found_instances),
         "instances": found_instances
     }
 
+def _health_check_instance(port: int, url: str) -> Optional[dict]:
+    """Check health of a single instance and return updated info, or None if unreachable."""
+    try:
+        response = requests.get(f"{url}/plugin-version", timeout=1)
+        if not response.ok:
+            return None
+
+        updates: dict = {}
+        try:
+            info_response = requests.get(f"{url}/program", timeout=1)
+            if info_response.ok:
+                info_data = info_response.json()
+                if "result" in info_data:
+                    result = info_data["result"]
+                    if isinstance(result, dict):
+                        program_id = result.get("programId", "")
+                        if ":" in program_id:
+                            project_name, file_path = program_id.split(":", 1)
+                            updates["project"] = project_name
+                            if file_path.startswith("/"):
+                                file_path = file_path[1:]
+                            updates["path"] = file_path
+                        updates["file"] = result.get("name", "")
+                        updates["language_id"] = result.get("languageId", "")
+                        updates["compiler_spec_id"] = result.get("compilerSpecId", "")
+                        updates["image_base"] = result.get("image_base", "")
+        except Exception:
+            pass  # Non-critical
+
+        return updates
+    except requests.exceptions.RequestException:
+        return None
+
+
 def periodic_discovery() -> None:
-    """Periodically discover new instances"""
+    """Periodically discover new instances and health-check existing ones."""
     while True:
         try:
-            _discover_instances(FULL_DISCOVERY_RANGE, timeout=0.5)
+            _discover_instances(FULL_DISCOVERY_RANGE, timeout=0.3)
 
+            # Snapshot current instances without holding lock during I/O
             with instances_lock:
-                ports_to_remove = []
-                for port, info in active_instances.items():
-                    url = info["url"]
-                    try:
-                        # Check HATEOAS API via plugin-version endpoint
-                        response = requests.get(f"{url}/plugin-version", timeout=1)
-                        if not response.ok:
-                            ports_to_remove.append(port)
-                            continue
-                            
-                        # Update program info if available (especially to get project name)
-                        try:
-                            info_url = f"{url}/program"
-                            info_response = requests.get(info_url, timeout=1)
-                            if info_response.ok:
-                                try:
-                                    info_data = info_response.json()
-                                    if "result" in info_data:
-                                        result = info_data["result"]
-                                        if isinstance(result, dict):
-                                            # Extract project and file from programId (format: "project:/file")
-                                            program_id = result.get("programId", "")
-                                            if ":" in program_id:
-                                                project_name, file_path = program_id.split(":", 1)
-                                                info["project"] = project_name
-                                                # Remove leading slash from file path if present
-                                                if file_path.startswith("/"):
-                                                    file_path = file_path[1:]
-                                                info["path"] = file_path
-                                            
-                                            # Get file name directly from the result
-                                            info["file"] = result.get("name", "")
-                                            
-                                            # Get other metadata
-                                            info["language_id"] = result.get("languageId", "")
-                                            info["compiler_spec_id"] = result.get("compilerSpecId", "")
-                                            info["image_base"] = result.get("image_base", "")
-                                except Exception as e:
-                                    print(f"Error parsing info endpoint during discovery: {e}", file=sys.stderr)
-                        except Exception:
-                            # Non-critical, continue even if update fails
-                            pass
-                            
-                    except requests.exceptions.RequestException:
-                        ports_to_remove.append(port)
+                snapshot = {port: info["url"] for port, info in active_instances.items()}
 
-                for port in ports_to_remove:
-                    del active_instances[port]
-                    print(f"Removed unreachable instance on port {port}")
+            # Health-check all instances in parallel
+            health_results: dict[int, Optional[dict]] = {}
+            with ThreadPoolExecutor(max_workers=min(len(snapshot), 10)) as executor:
+                futures = {
+                    executor.submit(_health_check_instance, port, url): port
+                    for port, url in snapshot.items()
+                }
+                for future in as_completed(futures):
+                    port = futures[future]
+                    health_results[port] = future.result()
+
+            # Apply results under the lock (no I/O here)
+            with instances_lock:
+                for port, updates in health_results.items():
+                    if port not in active_instances:
+                        continue
+                    if updates is None:
+                        del active_instances[port]
+                        print(f"Removed unreachable instance on port {port}")
+                    else:
+                        active_instances[port].update(updates)
+
         except Exception as e:
             print(f"Error in periodic discovery: {e}")
 
