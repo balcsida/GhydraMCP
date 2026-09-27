@@ -23,9 +23,9 @@ def list_open(ctx):
     """List all currently open programs in the Ghidra instance.
 
     Shows which binaries are open and which is the active/current program.
-    Use the program name with --program on other commands to target it.
+    MCP bridge tools that accept program=<name> can target any of them.
 
-    \\b
+    \b
     Example:
         ghydra programs list-open
     """
@@ -34,7 +34,7 @@ def list_open(ctx):
 
     try:
         result = client.get("programs/open-programs")
-        output = formatter.format_json(result)
+        output = formatter.format_simple_result(result)
         click.echo(output)
     except GhidraError as e:
         rich_echo(formatter.format_error(e), err=True)
@@ -50,7 +50,7 @@ def open_program(ctx, path):
     Opens a binary from the Ghidra project without switching away from the current program.
     Use 'ghydra project list-files' to see available files.
 
-    \\b
+    \b
     Example:
         ghydra programs open /malware.exe
     """
@@ -59,7 +59,7 @@ def open_program(ctx, path):
 
     try:
         result = client.post("programs/open", json_data={"path": path})
-        output = formatter.format_json(result)
+        output = formatter.format_simple_result(result)
         click.echo(output)
     except GhidraError as e:
         rich_echo(formatter.format_error(e), err=True)
@@ -68,11 +68,15 @@ def open_program(ctx, path):
 
 @programs.command('close')
 @click.argument('name')
+@click.option('--discard', is_flag=True, default=False,
+              help='Close even if the program has unsaved changes, discarding them')
 @click.pass_context
-def close_program(ctx, name):
+def close_program(ctx, name, discard):
     """Close an open program.
 
-    \\b
+    A program with unsaved changes is refused unless --discard is given.
+
+    \b
     Example:
         ghydra programs close malware.exe
     """
@@ -80,8 +84,8 @@ def close_program(ctx, name):
     formatter = ctx.obj['formatter']
 
     try:
-        result = client.post("programs/close", json_data={"name": name})
-        output = formatter.format_json(result)
+        result = client.post("programs/close", json_data={"name": name, "discard": discard})
+        output = formatter.format_simple_result(result)
         click.echo(output)
     except GhidraError as e:
         rich_echo(formatter.format_error(e), err=True)
@@ -95,9 +99,10 @@ def switch_program(ctx, name):
     """Switch the active/current program.
 
     Changes which program is the default for all operations.
-    Alternatively, pass --program=name to any command.
+    Alternatively, MCP bridge tools that accept program=<name> can target a
+    specific open program without switching.
 
-    \\b
+    \b
     Example:
         ghydra programs switch malware.exe
     """
@@ -106,7 +111,7 @@ def switch_program(ctx, name):
 
     try:
         result = client.post("programs/switch", json_data={"name": name})
-        output = formatter.format_json(result)
+        output = formatter.format_simple_result(result)
         click.echo(output)
     except GhidraError as e:
         rich_echo(formatter.format_error(e), err=True)

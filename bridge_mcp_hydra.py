@@ -8,6 +8,7 @@
 # ///
 # GhydraMCP Bridge for Ghidra HATEOAS API - Optimized for MCP integration
 # Provides namespaced tools for interacting with Ghidra's reverse engineering capabilities
+import base64
 import functools
 import os
 import signal
@@ -35,10 +36,13 @@ DEFAULT_GHIDRA_HOST = "localhost"
 QUICK_DISCOVERY_RANGE = range(DEFAULT_GHIDRA_PORT, DEFAULT_GHIDRA_PORT+10)
 FULL_DISCOVERY_RANGE = range(DEFAULT_GHIDRA_PORT, DEFAULT_GHIDRA_PORT+20)
 
-BRIDGE_VERSION = "v2.3.0"
-REQUIRED_API_VERSION = 2030
+BRIDGE_VERSION = "v3.0.0-rc.1"
+REQUIRED_API_VERSION = 3000
 
-DEFAULT_TIMEOUT = int(os.environ.get("GHIDRA_TIMEOUT", "30"))
+DEFAULT_TIMEOUT = int(os.environ.get("GHIDRA_TIMEOUT", "900"))
+DEFAULT_DECOMPILATION_TIMEOUT = int(
+    os.environ.get("GHIDRA_DECOMP_TIMEOUT", str(max(DEFAULT_TIMEOUT, 1200)))
+)
 
 # Discovery cache: avoid re-scanning if recently completed
 _last_discovery_time: float = 0.0
@@ -58,7 +62,7 @@ Multi-file support: A single Ghidra instance can have multiple programs open sim
 - Use `programs_list_open()` to see all open programs
 - Use `programs_open(path)` to open another binary from the project
 - Use `programs_switch(name)` to change the active program
-- Pass `program=name` parameter to any tool to target a specific open program without switching
+- Tools that take a `program` parameter can target a specific open program by name without switching
 
 The API is organized into namespaces for different types of operations:
 - instances_* : For managing Ghidra instances
@@ -66,6 +70,7 @@ The API is organized into namespaces for different types of operations:
 - functions_* : For working with functions
 - data_* : For working with data items
 - structs_* : For creating and managing struct data types
+- scalars_* : For searching scalar (constant) values in instructions
 - memory_* : For memory access and byte searching
 - xrefs_* : For cross-references
 - analysis_* : For program analysis
@@ -77,14 +82,22 @@ The API is organized into namespaces for different types of operations:
 - datatypes_* : For data type management
 - bookmarks_* : For managing bookmarks
 - batch_* : For batch operations (rename, comment, define)
+- tasks_* : For polling asynchronous operations (e.g. functions_decompile_async)
 """
 
-mcp = FastMCP("GhydraMCP", version=BRIDGE_VERSION, instructions=instructions)
+mcp = FastMCP("GhydraMCP", instructions=instructions)
 
-ghidra_host = os.environ.get("GHIDRA_HYDRA_HOST", DEFAULT_GHIDRA_HOST)
+# Backward-compatible host env resolution:
+# - GHIDRA_HYDRA_HOST: current preferred variable
+# - GHIDRA_HOST: legacy/common variable used in older setups
+ghidra_host = (
+    os.environ.get("GHIDRA_HYDRA_HOST")
+    or os.environ.get("GHIDRA_HOST")
+    or DEFAULT_GHIDRA_HOST
+)
 
 # Helper function to get the current instance or validate a specific port
-def _get_instance_port(port: Optional[int] = None) -> int:
+def _get_instance_port(port: int | None = None) -> int:
     """Internal helper to get the current instance port or validate a specific port"""
     port = port or current_instance_port
     # Validate that the instance exists and is active
@@ -127,9 +140,20 @@ def validate_origin(headers: dict) -> bool:
 
     return origin_base in ALLOWED_ORIGINS
 
-def _make_request(method: str, port: int, endpoint: str, params: dict = None,
-                 json_data: dict = None, data: str = None,
-                 headers: dict = None, program: str = None) -> dict:
+
+def _extract_requested_decompile_timeout(params: dict | None = None) -> int:
+    """Get requested decompile timeout from params with safe defaults."""
+    requested_timeout = None
+    if isinstance(params, dict):
+        requested_timeout = params.get("timeout")
+    try:
+        return int(requested_timeout) if requested_timeout is not None else DEFAULT_DECOMPILATION_TIMEOUT
+    except (TypeError, ValueError):
+        return DEFAULT_DECOMPILATION_TIMEOUT
+
+def _make_request(method: str, port: int, endpoint: str, params: dict | None = None, 
+                 json_data: dict | None = None, data: str | None = None, 
+                 headers: dict | None = None, program: str | None = None) -> dict:
     """Internal helper to make HTTP requests and handle common errors.
 
     Args:
@@ -151,6 +175,12 @@ def _make_request(method: str, port: int, endpoint: str, params: dict = None,
     
     if headers:
         request_headers.update(headers)
+
+    request_timeout = DEFAULT_TIMEOUT
+    if "decompile" in endpoint:
+        requested_timeout = _extract_requested_decompile_timeout(params)
+        # Keep transport timeout above decompiler timeout to avoid premature client-side cutoffs.
+        request_timeout = max(DEFAULT_TIMEOUT, requested_timeout + 30)
 
     is_state_changing = method.upper() in ["POST", "PUT", "PATCH", "DELETE"]
     if is_state_changing:
@@ -179,12 +209,21 @@ def _make_request(method: str, port: int, endpoint: str, params: dict = None,
             json=json_data,
             data=data,
             headers=request_headers,
-            timeout=DEFAULT_TIMEOUT
+            timeout=request_timeout
         )
+
+        # Successful empty-body responses (204 No Content from DELETE) are real
+        # successes, not "non-JSON response" errors.
+        if response.ok and not response.text.strip():
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "timestamp": int(time.time() * 1000)
+            }
 
         try:
             parsed_json = response.json()
-            
+
             # Add timestamp if not present
             if isinstance(parsed_json, dict) and "timestamp" not in parsed_json:
                 parsed_json["timestamp"] = int(time.time() * 1000)
@@ -227,11 +266,19 @@ def _make_request(method: str, port: int, endpoint: str, params: dict = None,
                 }
 
     except requests.exceptions.Timeout:
+        timeout_message = f"Request to {endpoint} timed out after {request_timeout}s."
+        if "decompile" in endpoint:
+            requested_timeout = _extract_requested_decompile_timeout(params)
+            suggested_timeout = max(requested_timeout * 2, DEFAULT_DECOMPILATION_TIMEOUT)
+            timeout_message += (
+                f" Decompilation can take longer for large functions; retry with a higher timeout "
+                f"(for example timeout={suggested_timeout}) and/or increase GHIDRA_TIMEOUT."
+            )
         return {
             "success": False,
             "error": {
                 "code": "REQUEST_TIMEOUT",
-                "message": "Request timed out"
+                "message": timeout_message
             },
             "status_code": 408,
             "timestamp": int(time.time() * 1000)
@@ -257,16 +304,16 @@ def _make_request(method: str, port: int, endpoint: str, params: dict = None,
             "timestamp": int(time.time() * 1000)
         }
 
-def safe_get(port: int, endpoint: str, params: dict = None, program: str = None) -> dict:
+def safe_get(port: int, endpoint: str, params: dict | None = None, program: str | None = None) -> dict:
     """Make GET request to Ghidra instance"""
     return _make_request("GET", port, endpoint, params=params, program=program)
 
-def safe_put(port: int, endpoint: str, data: dict, program: str = None) -> dict:
+def safe_put(port: int, endpoint: str, data: dict, program: str | None = None) -> dict:
     """Make PUT request to Ghidra instance with JSON payload"""
     headers = data.pop("headers", None) if isinstance(data, dict) else None
     return _make_request("PUT", port, endpoint, json_data=data, headers=headers, program=program)
 
-def safe_post(port: int, endpoint: str, data: Union[dict, str], program: str = None) -> dict:
+def safe_post(port: int, endpoint: str, data: Union[dict, str], program: str | None = None) -> dict:
     """Perform a POST request to a specific Ghidra instance with JSON or text payload"""
     headers = None
     json_payload = None
@@ -280,14 +327,14 @@ def safe_post(port: int, endpoint: str, data: Union[dict, str], program: str = N
 
     return _make_request("POST", port, endpoint, json_data=json_payload, data=text_payload, headers=headers, program=program)
 
-def safe_patch(port: int, endpoint: str, data: dict, program: str = None) -> dict:
+def safe_patch(port: int, endpoint: str, data: dict, program: str | None = None) -> dict:
     """Perform a PATCH request to a specific Ghidra instance with JSON payload"""
     headers = data.pop("headers", None) if isinstance(data, dict) else None
     return _make_request("PATCH", port, endpoint, json_data=data, headers=headers, program=program)
 
-def safe_delete(port: int, endpoint: str, program: str = None) -> dict:
+def safe_delete(port: int, endpoint: str, params: dict | None = None, program: str | None = None) -> dict:
     """Perform a DELETE request to a specific Ghidra instance"""
-    return _make_request("DELETE", port, endpoint, program=program)
+    return _make_request("DELETE", port, endpoint, params=params, program=program)
 
 
 # ================= Text Formatters =================
@@ -303,13 +350,25 @@ def format_error(response: dict) -> str:
     return "Error: Unknown error"
 
 
+def _list_total(response: dict, items: list) -> int:
+    """Total item count: the Javalin server nests it at meta.total; older builds
+    used top-level size. Fall back to the page length."""
+    meta = response.get("meta")
+    if isinstance(meta, dict):
+        if "total" in meta:
+            return meta["total"]
+        if "total_estimate" in meta:
+            return meta["total_estimate"]
+    return response.get("size", response.get("total_estimate", len(items)))
+
+
 def format_functions_list(response: dict, offset: int = 0, limit: int = 100, **kwargs) -> str:
     """Format function list as plain text table"""
     if not response.get("success", False):
         return format_error(response)
 
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Functions ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -367,7 +426,45 @@ def format_decompile(response: dict, **kwargs) -> str:
         return format_error(response)
 
     result = response.get("result", {})
-    code = result.get("ccode") or result.get("decompiled") or ""
+    # Javalin server sends "decompilation"; older builds used "ccode"/"decompiled".
+    code = result.get("decompilation") or result.get("ccode") or result.get("decompiled") or ""
+    # The DTO carries its own success flag for decompiler-level failures.
+    if not code and result.get("success") is False:
+        return f"Decompilation failed: {result.get('errorMessage', 'unknown error')}"
+    message = result.get("message")
+    suggested_timeout = result.get("suggested_timeout_seconds")
+    retry_recommended = bool(result.get("retry_recommended"))
+    decompile_error = result.get("decompile_error") or result.get("errorMessage")
+
+    # Line filtering happens client-side (the server returns the full function).
+    start_line = kwargs.get("start_line")
+    end_line = kwargs.get("end_line")
+    max_lines = kwargs.get("max_lines")
+    if code and (start_line or end_line or max_lines):
+        all_lines = code.splitlines()
+        total = len(all_lines)
+        s = max(1, start_line or 1)
+        e = min(end_line or total, total)
+        if max_lines:
+            e = min(e, s + max_lines - 1)
+        selected = all_lines[s - 1:e]
+        code = "\n".join([f"// lines {s}-{e} of {total}"] + selected)
+
+    advisory_lines = []
+    if retry_recommended:
+        if message:
+            advisory_lines.append(f"// {message}")
+        if suggested_timeout:
+            advisory_lines.append(f"// Suggested timeout: {suggested_timeout}s")
+        if decompile_error:
+            advisory_lines.append(f"// Decompiler error: {decompile_error}")
+
+    if advisory_lines:
+        advisory_text = "\n".join(advisory_lines)
+        if not code:
+            return advisory_text
+        if advisory_text.lower() not in code.lower():
+            return f"{code.rstrip()}\n\n{advisory_text}"
 
     if not code:
         return "Error: No decompiled code returned"
@@ -381,14 +478,31 @@ def format_disassembly(response: dict, **kwargs) -> str:
         return format_error(response)
 
     result = response.get("result", {})
-    instructions = result.get("instructions", [])
+    # The javalin-port API returns the instruction list directly as `result`;
+    # the legacy API nests it under result["instructions"]. Handle both.
+    if isinstance(result, list):
+        instructions = result
+        result = {}
+    else:
+        instructions = result.get("instructions", [])
 
     # simplify_response converts instructions list to disassembly_text
     if not instructions and "disassembly_text" in result:
-        return result["disassembly_text"].rstrip()
+        disasm_text = result["disassembly_text"].rstrip()
+        if not disasm_text:
+            if "message" in result:
+                return result["message"]
+            if "warning" in result:
+                return f"Warning: {result['warning']}"
+            return "No disassembly available"
+        return disasm_text
 
     if not instructions:
-        return "Error: No disassembly returned"
+        if "message" in result:
+            return result["message"]
+        if "warning" in result:
+            return f"Warning: {result['warning']}"
+        return "No disassembly available"
 
     lines = []
     for instr in instructions:
@@ -398,10 +512,21 @@ def format_disassembly(response: dict, **kwargs) -> str:
         operands = instr.get("operands", "")
         lines.append(f"  {addr}  {bytes_hex:<12} {mnemonic:<8} {operands}")
 
+    # Surface truncation: the server caps a page (default 100 instructions) and the
+    # raw list carries no hint that more follow, so a long function silently looks
+    # complete. meta.total is the full instruction count for the function.
+    meta = response.get("meta") or {}
+    total = _list_total(response, instructions)
+    offset = meta.get("offset") or 0
+    shown = len(instructions)
+    if offset + shown < total:
+        more = total - offset - shown
+        lines.append(f"\n  ... {more} more instruction(s) of {total} total (use offset={offset + shown})")
+
     return "\n".join(lines)
 
 
-def format_xrefs(response: dict, to_addr: str = None, from_addr: str = None, **kwargs) -> str:
+def format_xrefs(response: dict, to_addr: str | None = None, from_addr: str | None = None, **kwargs) -> str:
     """Format cross-references as plain text"""
     if not response.get("success", False):
         return format_error(response)
@@ -413,7 +538,7 @@ def format_xrefs(response: dict, to_addr: str = None, from_addr: str = None, **k
     else:
         items = result if isinstance(result, list) else []
 
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
     target = to_addr or from_addr
 
     header = f"References"
@@ -426,19 +551,29 @@ def format_xrefs(response: dict, to_addr: str = None, from_addr: str = None, **k
 
     lines = [header]
     for xref in items:
-        from_a = xref.get("from_addr", "???")
+        # Server XrefDto uses fromAddress/toAddress/fromFunction; accept legacy names too.
+        from_a = xref.get("fromAddress") or xref.get("from_addr", "???")
+        to_a = xref.get("toAddress") or xref.get("to_addr", "")
         ref_type = xref.get("refType", "???")
-        from_func_obj = xref.get("from_function", {})
+        from_func_obj = xref.get("fromFunction") or xref.get("from_function") or ""
+        to_func_obj = xref.get("toFunction") or ""
 
-        # Extract function name if from_function is a dict
+        # Extract function name if it is a dict
         if isinstance(from_func_obj, dict):
             from_func = from_func_obj.get("name", "")
         else:
             from_func = from_func_obj or ""
+        to_func = to_func_obj.get("name", "") if isinstance(to_func_obj, dict) else (to_func_obj or "")
 
-        line = f"  {from_a}  {ref_type:<10}"
+        line = f"  {from_a}"
+        if from_addr and to_a:
+            # listing refs FROM an address: the target is the interesting part
+            line += f" -> {to_a}"
+        line += f"  {ref_type:<10}"
         if from_func:
             line += f"  from {from_func}"
+        if to_func and from_addr:
+            line += f"  to {to_func}"
         lines.append(line)
 
     return "\n".join(lines)
@@ -450,7 +585,7 @@ def format_strings(response: dict, offset: int = 0, **kwargs) -> str:
         return format_error(response)
 
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Strings ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -471,13 +606,13 @@ def format_data_list(response: dict, offset: int = 0, limit: int = 100, **kwargs
         return format_error(response)
 
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Data items ({offset+1}-{offset+len(items)} of {total}):", ""]
 
     for d in items:
         addr = d.get("address", "???")
-        label = d.get("name", "")
+        label = d.get("label") or d.get("name", "")  # DataDto field is 'label'
         dtype = d.get("dataType", "???")  # Java returns 'dataType' not 'type'
         value = d.get("value", "")
 
@@ -532,8 +667,6 @@ def format_instance_info(response: dict, **kwargs) -> str:
     project = response.get("project", "")
     lang = response.get("language", "")
     base = response.get("base_address", "")
-    analysis = "complete" if response.get("analysis_complete") else "incomplete"
-
     lines = [f"Instance :{port}"]
     if project:
         lines.append(f"Project:  {project}")
@@ -542,7 +675,13 @@ def format_instance_info(response: dict, **kwargs) -> str:
         lines.append(f"Language: {lang}")
     if base:
         lines.append(f"Base:     {base}")
-    lines.append(f"Analysis: {analysis}")
+    if response.get("function_count") is not None:
+        lines.append(f"Functions: {response['function_count']}")
+    if response.get("symbol_count") is not None:
+        lines.append(f"Symbols:  {response['symbol_count']}")
+    # /program does not report analysis state; only show it when actually present.
+    if "analysis_complete" in response:
+        lines.append(f"Analysis: {'complete' if response['analysis_complete'] else 'incomplete'}")
 
     return "\n".join(lines)
 
@@ -554,8 +693,10 @@ def format_memory(response: dict, **kwargs) -> str:
 
     result = response.get("result", response)
     addr = result.get("address", "???")
-    hex_bytes = result.get("hexBytes", "")
-    length = result.get("bytesRead", result.get("length", 0))
+    hex_bytes = result.get("hex") or result.get("hexBytes") or ""
+    if not hex_bytes and isinstance(result.get("bytes"), list):
+        hex_bytes = "".join(f"{b:02x}" for b in result["bytes"])
+    length = result.get("length", result.get("bytesRead", 0))
 
     lines = [f"Memory at {addr} ({length} bytes):"]
 
@@ -586,22 +727,37 @@ def format_variables(response: dict, **kwargs) -> str:
         return format_error(response)
 
     result = response.get("result", {})
-    fn_name = result.get("functionName", "???")
-    params = result.get("parameters", [])
-    locals_list = result.get("localVariables", [])
+
+    # Javalin server shape: {function: {name, address}, variables: [{name, type,
+    # isParameter, storage, source}]}. Older builds: functionName/parameters/localVariables.
+    fn = result.get("function")
+    if isinstance(fn, dict):
+        fn_name = fn.get("name", "???")
+        variables = result.get("variables", [])
+        params = [v for v in variables if v.get("isParameter")]
+        locals_list = [v for v in variables if not v.get("isParameter")]
+        type_key = "type"
+    else:
+        fn_name = result.get("functionName", "???")
+        params = result.get("parameters", [])
+        locals_list = result.get("localVariables", [])
+        type_key = "dataType"
 
     lines = [f"Variables for {fn_name}:"]
 
     if params:
         lines.append(f"\nParameters ({len(params)}):")
         for p in params:
-            lines.append(f"  {p.get('dataType', '?'):<20} {p.get('name', '?')}")
+            storage = p.get('storage', '')
+            lines.append(f"  {p.get(type_key, '?'):<20} {p.get('name', '?'):<20} {storage}")
 
     if locals_list:
         lines.append(f"\nLocal variables ({len(locals_list)}):")
         for v in locals_list:
             storage = v.get('storage', '')
-            lines.append(f"  {v.get('dataType', '?'):<20} {v.get('name', '?'):<20} {storage}")
+            source = v.get('source', '')
+            suffix = f"  [{source}]" if source == "decompiler" else ""
+            lines.append(f"  {v.get(type_key, '?'):<20} {v.get('name', '?'):<20} {storage}{suffix}")
 
     if not params and not locals_list:
         lines.append("  (no variables)")
@@ -615,35 +771,78 @@ def format_callgraph(response: dict, **kwargs) -> str:
         return format_error(response)
 
     result = response.get("result", {})
-    root = result.get("rootFunction", "???")
-    nodes = result.get("nodes", [])
-    edges = result.get("edges", [])
 
-    lines = [f"Call graph from {root}:", f"  {len(nodes)} functions, {len(edges)} calls", ""]
+    # Server shape: {root: {name, address, ...}, depth, direction,
+    #                callers: [{function: {...}, callers: [...]}],
+    #                callees: [{function: {...}, callees: [...]}]}
+    root = result.get("root")
+    if not isinstance(root, dict):
+        return "No call graph data returned."
 
-    calls = {}
-    for edge in edges:
-        caller = edge.get("from", "")
-        callee = edge.get("to", "")
-        if caller not in calls:
-            calls[caller] = []
-        calls[caller].append(callee)
+    root_name = root.get("name", "???")
+    root_addr = root.get("address", "")
+    depth = result.get("depth", "?")
 
-    def show_calls(fn, indent=0, seen=None):
-        if seen is None:
-            seen = set()
-        if fn in seen:
-            return [f"{'  ' * indent}{fn} (recursive)"]
-        seen.add(fn)
-        result_lines = [f"{'  ' * indent}{fn}"]
-        if fn in calls and indent < 3:
-            for callee in calls[fn][:10]:
-                result_lines.extend(show_calls(callee, indent + 1, seen.copy()))
-            if len(calls[fn]) > 10:
-                result_lines.append(f"{'  ' * (indent + 1)}... and {len(calls[fn]) - 10} more")
-        return result_lines
+    def render_tree(nodes, child_key, indent=1, budget=None):
+        if budget is None:
+            budget = [200]  # total line budget across the whole tree
+        out = []
+        if not isinstance(nodes, list):
+            return out
+        for node in nodes:
+            if budget[0] <= 0:
+                out.append(f"{'  ' * indent}...")
+                break
+            if not isinstance(node, dict):
+                continue
+            fn = node.get("function", {})
+            name = fn.get("name", "???")
+            addr = fn.get("address", "")
+            out.append(f"{'  ' * indent}{name}  {addr}")
+            budget[0] -= 1
+            out.extend(render_tree(node.get(child_key), child_key, indent + 1, budget))
+        return out
 
-    lines.extend(show_calls(root))
+    lines = [f"Call graph for {root_name} ({root_addr}), depth {depth}:"]
+
+    callers = result.get("callers")
+    if callers is not None:
+        lines.append("")
+        lines.append(f"Callers ({len(callers)}):")
+        lines.extend(render_tree(callers, "callers") or ["  (none)"])
+
+    callees = result.get("callees")
+    if callees is not None:
+        lines.append("")
+        lines.append(f"Callees ({len(callees)}):")
+        lines.extend(render_tree(callees, "callees") or ["  (none)"])
+
+    return "\n".join(lines)
+
+
+def format_dataflow(response: dict, **kwargs) -> str:
+    """Format data flow analysis as plain text"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    result = response.get("result", {})
+    steps = result.get("steps", [])
+
+    if not steps:
+        return "No data flow steps found."
+
+    lines = [f"Data Flow ({len(steps)} steps):", ""]
+
+    for i, step in enumerate(steps, 1):
+        addr = step.get("address", step.get("to", step.get("from", "???")))
+        # Server steps carry instruction text + containing function + reference list.
+        instr = step.get("instruction", step.get("description", step.get("label", "")))
+        fn = step.get("function", "")
+        fn_part = f"  [{fn}]" if fn else ""
+        lines.append(f"  {i:>2}. {addr}  {instr}{fn_part}")
+        for ref in step.get("references", [])[:8]:
+            lines.append(f"        {ref.get('type', '?'):<14} {ref.get('from', '?')} -> {ref.get('to', '?')}")
+
     return "\n".join(lines)
 
 
@@ -653,7 +852,7 @@ def format_structs_list(response: dict, offset: int = 0, **kwargs) -> str:
         return format_error(response)
 
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Structs ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -687,7 +886,7 @@ def format_struct_info(response: dict, **kwargs) -> str:
             foffset = f.get("offset", 0)
             fname = f.get("name", "???")
             ftype = f.get("type", "???")
-            fsize = f.get("size", "?")
+            fsize = f.get("length", f.get("size", "?"))  # StructFieldDto field is 'length'
             lines.append(f"  +{foffset:<4} {ftype:<20} {fname:<20} ({fsize} bytes)")
     else:
         lines.append("  (no fields)")
@@ -731,10 +930,50 @@ def format_simple_result(response: dict, success_msg: str = "Done", **kwargs) ->
     return success_msg
 
 
+def format_generic_dict(response: dict, **kwargs) -> str:
+    """Format a dictionary result as key-value pairs"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    result = response.get("result", response)
+    if not isinstance(result, dict):
+        return str(result)
+
+    lines = []
+    for k, v in result.items():
+        if k == "_links" or k == "success" or k == "timestamp":
+            continue
+        lines.append(f"{k}: {v}")
+    return "\n".join(lines)
+
+
+def format_generic_list(response: dict, **kwargs) -> str:
+    """Format a list result as plain text lines"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    items = response.get("result", [])
+    if not isinstance(items, list):
+        return str(items)
+
+    if not items:
+        return "No items found."
+
+    lines = []
+    for item in items:
+        if isinstance(item, dict):
+            # Try to find a name or description field
+            label = item.get("name") or item.get("path") or item.get("id") or str(item)
+            lines.append(f"  {label}")
+        else:
+            lines.append(f"  {item}")
+    return "\n".join(lines)
+
+
 def format_classes_list(response: dict, offset: int = 0, limit: int = 100, **kwargs) -> str:
     """Format classes list as text"""
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Classes ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -753,7 +992,7 @@ def format_classes_list(response: dict, offset: int = 0, limit: int = 100, **kwa
 def format_symbols_list(response: dict, offset: int = 0, limit: int = 100, **kwargs) -> str:
     """Format symbols list as text"""
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Symbols ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -761,10 +1000,8 @@ def format_symbols_list(response: dict, offset: int = 0, limit: int = 100, **kwa
         addr = s.get("address", "???")
         name = s.get("name", "???")
         stype = s.get("type", "")
-        namespace = s.get("namespace", "")
         primary = " *" if s.get("isPrimary") else ""
-        ns_str = f"  [{namespace}]" if namespace and namespace != "Global" else ""
-        lines.append(f"  {addr}  {stype:<12}  {name}{primary}{ns_str}")
+        lines.append(f"  {addr}  {stype:<12}  {name}{primary}")
 
     return "\n".join(lines)
 
@@ -772,7 +1009,7 @@ def format_symbols_list(response: dict, offset: int = 0, limit: int = 100, **kwa
 def format_imports_exports(response: dict, offset: int = 0, limit: int = 100, **kwargs) -> str:
     """Format imports/exports list as text"""
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Entries ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -787,7 +1024,7 @@ def format_imports_exports(response: dict, offset: int = 0, limit: int = 100, **
 def format_segments_list(response: dict, offset: int = 0, limit: int = 100, **kwargs) -> str:
     """Format segments list as text"""
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Segments ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -796,11 +1033,12 @@ def format_segments_list(response: dict, offset: int = 0, limit: int = 100, **kw
         start = seg.get("start", "???")
         end = seg.get("end", "???")
         size = seg.get("size", 0)
+        # MemoryBlockDto serializes isRead/isWrite/isExecute/isInitialized.
         perms = ""
-        perms += "R" if seg.get("readable") else "-"
-        perms += "W" if seg.get("writable") else "-"
-        perms += "X" if seg.get("executable") else "-"
-        init = "init" if seg.get("initialized") else "uninit"
+        perms += "R" if seg.get("isRead", seg.get("readable")) else "-"
+        perms += "W" if seg.get("isWrite", seg.get("writable")) else "-"
+        perms += "X" if seg.get("isExecute", seg.get("executable")) else "-"
+        init = "init" if seg.get("isInitialized", seg.get("initialized")) else "uninit"
         lines.append(f"  {name:<16}  {start}-{end}  {size:>8} bytes  {perms}  {init}")
 
     return "\n".join(lines)
@@ -809,7 +1047,7 @@ def format_segments_list(response: dict, offset: int = 0, limit: int = 100, **kw
 def format_namespaces_list(response: dict, offset: int = 0, limit: int = 100, **kwargs) -> str:
     """Format namespaces list as text"""
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Namespaces ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -825,7 +1063,7 @@ def format_namespaces_list(response: dict, offset: int = 0, limit: int = 100, **
 def format_variables_list(response: dict, offset: int = 0, limit: int = 100, **kwargs) -> str:
     """Format variables list as text"""
     items = response.get("result", [])
-    total = response.get("size", response.get("total_estimate", len(items)))
+    total = _list_total(response, items)
 
     lines = [f"Variables ({offset+1}-{offset+len(items)} of ~{total}):", ""]
 
@@ -844,7 +1082,7 @@ def format_variables_list(response: dict, offset: int = 0, limit: int = 100, **k
 def format_datatypes_list(response: dict, offset: int = 0, limit: int = 100, **kwargs) -> str:
     """Format datatypes list as text"""
     items = response.get("result", [])
-    total = response.get("size", len(items))
+    total = _list_total(response, items)
 
     lines = [f"Data Types ({offset+1}-{offset+len(items)} of {total}):", ""]
 
@@ -865,22 +1103,162 @@ def format_datatypes_list(response: dict, offset: int = 0, limit: int = 100, **k
 
 # ================= Formatter Registry & Decorator =================
 
+def format_scalars(response: dict, **kwargs) -> str:
+    """Format scalar search results as plain text"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    items = response.get("result", [])
+    meta = response.get("meta") or {}
+    offset = meta.get("offset", 0)
+
+    if not items:
+        if meta.get("scanTruncated"):
+            return "No scalars found (scan truncated before completing; narrow with in_function or a more specific value)"
+        return "No scalars found"
+
+    lines = [f"Scalars ({offset + 1}-{offset + len(items)}):", ""]
+    for s in items:
+        addr = s.get("address", "")
+        hexv = s.get("hexValue", "")
+        op = s.get("operandIndex", "?")
+        instr = s.get("instruction", "")
+        in_fn = s.get("inFunction") or "-"
+        line = f"  {addr}  {hexv:<12} op{op}  {instr}  [in {in_fn}]"
+        to_fn = s.get("toFunction")
+        if to_fn:
+            line += f"  -> calls {to_fn}"
+        lines.append(line)
+
+    if meta.get("scanTruncated"):
+        lines.append("")
+        lines.append("  (scan stopped early to keep the UI responsive; results may be incomplete "
+                     "- narrow with in_function or a more specific value)")
+    elif (response.get("_links") or {}).get("next"):
+        lines.append(f"\n  ... more available (use offset={offset + len(items)})")
+
+    return "\n".join(lines)
+
+
+def format_open_programs(response: dict, **kwargs) -> str:
+    """Format the list of programs open in a Ghidra instance"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    items = response.get("result", [])
+    if not isinstance(items, list) or not items:
+        return "No programs open."
+
+    lines = [f"Open programs ({len(items)}):", ""]
+    for p in items:
+        marker = "*" if p.get("isCurrent") else " "
+        lines.append(f" {marker} {p.get('name', '?')}  [{p.get('language', '')}]  {p.get('path', '')}")
+    lines.append("")
+    lines.append("  (* = current program; pass program=<name> to target another one)")
+    return "\n".join(lines)
+
+
+def format_bookmarks(response: dict, **kwargs) -> str:
+    """Format a bookmark listing"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    items = response.get("result", [])
+    if not isinstance(items, list) or not items:
+        return "No bookmarks found."
+
+    meta = response.get("meta") or {}
+    offset = meta.get("offset", kwargs.get("offset", 0))
+    total = meta.get("total")
+    header = f"Bookmarks ({offset + 1}-{offset + len(items)}"
+    header += f" of {total}):" if total is not None else "):"
+    lines = [header, ""]
+    for b in items:
+        category = f" [{b['category']}]" if b.get("category") else ""
+        comment = f"  {b['comment']}" if b.get("comment") else ""
+        lines.append(f"  {b.get('address', '?')}  {b.get('type', '')}{category}{comment}")
+    if total is not None and offset + len(items) < total:
+        lines.append(f"\n  ... more available (use offset={offset + len(items)})")
+    return "\n".join(lines)
+
+
+def format_memory_search(response: dict, **kwargs) -> str:
+    """Format byte-pattern search results"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    result = response.get("result") or {}
+    matches = result.get("matches") or []
+    pattern = result.get("pattern", "")
+    offset = result.get("offset", 0)
+    if not matches:
+        return f"No matches for pattern {pattern}"
+
+    lines = [f"Matches for {pattern} ({offset + 1}-{offset + len(matches)}):", ""]
+    for m in matches:
+        lines.append(f"  {m.get('address', m) if isinstance(m, dict) else m}")
+    if result.get("hasMore"):
+        lines.append(f"\n  ... more may be available (use offset={offset + len(matches)})")
+    return "\n".join(lines)
+
+
+def format_batch_result(response: dict, **kwargs) -> str:
+    """Format the summary of a batch operation"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    result = response.get("result") or {}
+    lines = [f"Batch: {result.get('successful', 0)}/{result.get('total', 0)} succeeded, "
+             f"{result.get('failed', 0)} failed", ""]
+    for item in result.get("results") or []:
+        target = item.get("address") or item.get("old_name") or "?"
+        detail = item.get("new_name") or item.get("type") or ""
+        lines.append(f"  {target}  {item.get('status', '?')}  {detail}".rstrip())
+    return "\n".join(lines)
+
+
+def format_task_result(response: dict, **kwargs) -> str:
+    """Format an async task result (decompiled code when completed)"""
+    if not response.get("success", False):
+        return format_error(response)
+
+    result = response.get("result") or {}
+    status = result.get("status", "unknown")
+    if status != "completed":
+        return f"Task {result.get('task_id', '')} is {status}; poll again later."
+    return result.get("decompiled") or "(empty result)"
+
+
 FORMATTERS = {
     "functions_list": format_functions_list,
     "functions_get": format_function_info,
+    "functions_get_containing": format_functions_list,
+    "functions_get_next": format_functions_list,
+    "functions_get_prev": format_functions_list,
     "functions_decompile": format_decompile,
     "functions_disassemble": format_disassembly,
     "functions_get_variables": format_variables,
     "xrefs_list": format_xrefs,
+    "scalars_search": format_scalars,
     "data_list": format_data_list,
     "data_list_strings": format_strings,
     "memory_read": format_memory,
+    "memory_disassemble": format_disassembly,
     "instances_list": format_instances,
     "instances_discover": format_instances,
     "instances_current": format_instance_info,
     "structs_list": format_structs_list,
     "structs_get": format_struct_info,
     "analysis_get_callgraph": format_callgraph,
+    "analysis_get_dataflow": format_dataflow,
+    "analysis_status": format_generic_dict,
+    "ui_get_current_address": format_generic_dict,
+    "ui_get_current_function": format_function_info,
+    "comments_get": format_generic_dict,
+    "projects_list": format_generic_list,
+    "projects_get": format_generic_dict,
+    "programs_list": format_generic_list,
+    "programs_get": format_generic_dict,
     "project_info": format_project_info,
     "project_list_files": format_project_files,
     "classes_list": format_classes_list,
@@ -892,6 +1270,24 @@ FORMATTERS = {
     "variables_list": format_variables_list,
     "datatypes_list": format_datatypes_list,
     "datatypes_search": format_datatypes_list,
+    "programs_list_open": format_open_programs,
+    "programs_open": format_generic_dict,
+    "programs_close": format_generic_dict,
+    "programs_switch": format_generic_dict,
+    "bookmarks_list": format_bookmarks,
+    "bookmarks_add": format_generic_dict,
+    "bookmarks_delete": format_generic_dict,
+    "memory_search_bytes": format_memory_search,
+    "batch_rename_functions": format_batch_result,
+    "batch_set_comments": format_batch_result,
+    "batch_define_data": format_batch_result,
+    "data_clear": format_generic_dict,
+    "data_create_label": format_generic_dict,
+    "data_at_address": format_generic_dict,
+    "datatypes_apply": format_generic_dict,
+    "functions_decompile_async": format_generic_dict,
+    "tasks_get_status": format_generic_dict,
+    "tasks_get_result": format_task_result,
 }
 
 
@@ -996,7 +1392,9 @@ def simplify_response(response: dict) -> dict:
                 result_copy.pop("instructions", None)
             
             # Special case for decompiled code - make sure it's directly accessible
-            if "ccode" in result_copy:
+            if "decompilation" in result_copy:
+                result_copy["decompiled_text"] = result_copy["decompilation"]
+            elif "ccode" in result_copy:
                 result_copy["decompiled_text"] = result_copy["ccode"]
             elif "decompiled" in result_copy:
                 result_copy["decompiled_text"] = result_copy["decompiled"]
@@ -1024,7 +1422,7 @@ def simplify_response(response: dict) -> dict:
     
     return result
 
-def register_instance(port: int, url: Optional[str] = None) -> str:
+def register_instance(port: int, url: str | None = None) -> str:
     """Register a new Ghidra instance
     
     Args:
@@ -1097,7 +1495,7 @@ def register_instance(port: int, url: Optional[str] = None) -> str:
                                 # Get other metadata
                                 project_info["language_id"] = result.get("languageId", "")
                                 project_info["compiler_spec_id"] = result.get("compilerSpecId", "")
-                                project_info["image_base"] = result.get("image_base", "")
+                                project_info["image_base"] = result.get("imageBase", result.get("image_base", ""))
                                 
                                 # Store _links from result for HATEOAS navigation
                                 if "_links" in result:
@@ -1117,7 +1515,7 @@ def register_instance(port: int, url: Optional[str] = None) -> str:
     except Exception as e:
         return f"Error: Could not connect to instance at {url}: {str(e)}"
 
-def _probe_port(port: int, scan_host: str, timeout: float) -> Optional[dict]:
+def _probe_port(port: int, scan_host: str, timeout: float) -> dict | None:
     """Probe a single port for a Ghidra instance. Returns instance info or None."""
     url = f"http://{scan_host}:{port}"
     try:
@@ -1156,7 +1554,7 @@ def _probe_port(port: int, scan_host: str, timeout: float) -> Optional[dict]:
         return None
 
 
-def _discover_instances(port_range: range, host: Optional[str] = None, timeout: float = 0.3) -> dict:
+def _discover_instances(port_range: range, host: str | None = None, timeout: float = 0.3) -> dict:
     """Internal function to discover NEW Ghidra instances by scanning ports in parallel.
 
     This function only returns newly discovered instances that weren't already
@@ -1165,16 +1563,19 @@ def _discover_instances(port_range: range, host: Optional[str] = None, timeout: 
     """
     global _last_discovery_time
 
-    # Skip if we discovered recently (cache TTL)
+    # Skip if the default host was scanned recently (cache TTL). Explicit
+    # scans of another host always run.
+    use_cache = host is None
     now = time.monotonic()
-    if now - _last_discovery_time < _DISCOVERY_CACHE_TTL:
+    if use_cache and now - _last_discovery_time < _DISCOVERY_CACHE_TTL:
         return {"found": 0, "instances": []}
 
     scan_host = host if host is not None else ghidra_host
     ports_to_scan = [p for p in port_range if p not in active_instances]
 
     if not ports_to_scan:
-        _last_discovery_time = now
+        if use_cache:
+            _last_discovery_time = now
         return {"found": 0, "instances": []}
 
     found_instances: list[dict] = []
@@ -1189,14 +1590,15 @@ def _discover_instances(port_range: range, host: Optional[str] = None, timeout: 
             if info is not None:
                 found_instances.append(info)
 
-    _last_discovery_time = time.monotonic()
+    if use_cache:
+        _last_discovery_time = time.monotonic()
 
     return {
         "found": len(found_instances),
         "instances": found_instances
     }
 
-def _health_check_instance(port: int, url: str) -> Optional[dict]:
+def _health_check_instance(port: int, url: str) -> dict | None:
     """Check health of a single instance and return updated info, or None if unreachable."""
     try:
         response = requests.get(f"{url}/plugin-version", timeout=1)
@@ -1221,7 +1623,7 @@ def _health_check_instance(port: int, url: str) -> Optional[dict]:
                         updates["file"] = result.get("name", "")
                         updates["language_id"] = result.get("languageId", "")
                         updates["compiler_spec_id"] = result.get("compilerSpecId", "")
-                        updates["image_base"] = result.get("image_base", "")
+                        updates["image_base"] = result.get("imageBase", result.get("image_base", ""))
         except Exception:
             pass  # Non-critical
 
@@ -1240,16 +1642,18 @@ def periodic_discovery() -> None:
             with instances_lock:
                 snapshot = {port: info["url"] for port, info in active_instances.items()}
 
-            # Health-check all instances in parallel
-            health_results: dict[int, Optional[dict]] = {}
-            with ThreadPoolExecutor(max_workers=min(len(snapshot), 10)) as executor:
-                futures = {
-                    executor.submit(_health_check_instance, port, url): port
-                    for port, url in snapshot.items()
-                }
-                for future in as_completed(futures):
-                    port = futures[future]
-                    health_results[port] = future.result()
+            # Health-check all instances in parallel (ThreadPoolExecutor
+            # rejects max_workers=0, so skip when nothing is registered)
+            health_results: dict[int, dict | None] = {}
+            if snapshot:
+                with ThreadPoolExecutor(max_workers=min(len(snapshot), 10)) as executor:
+                    futures = {
+                        executor.submit(_health_check_instance, port, url): port
+                        for port, url in snapshot.items()
+                    }
+                    for future in as_completed(futures):
+                        port = futures[future]
+                        health_results[port] = future.result()
 
             # Apply results under the lock (no I/O here)
             with instances_lock:
@@ -1267,7 +1671,7 @@ def periodic_discovery() -> None:
 
         time.sleep(30)
 
-def handle_sigint(signum: int, frame: Any) -> None:
+def handle_sigint(signum, frame):
     os._exit(0)
 
 # ================= MCP Resources =================
@@ -1275,7 +1679,7 @@ def handle_sigint(signum: int, frame: Any) -> None:
 # They focus on data and minimize metadata
 
 @mcp.resource(uri="/instance/{port}")
-def ghidra_instance(port: int = None) -> dict:
+def ghidra_instance(port: int | None = None) -> dict:
     """Get detailed information about a Ghidra instance and the loaded program
     
     Args:
@@ -1303,6 +1707,7 @@ def ghidra_instance(port: int = None) -> dict:
             "timestamp": int(time.time() * 1000)
         }
     
+    stats = result.get("statistics") or {}
     instance_info = {
         "port": port,
         "url": get_instance_url(port),
@@ -1311,8 +1716,8 @@ def ghidra_instance(port: int = None) -> dict:
         "language": result.get("languageId", "unknown"),
         "compiler": result.get("compilerSpecId", "unknown"),
         "base_address": result.get("imageBase", "0x0"),
-        "memory_size": result.get("memorySize", 0),
-        "analysis_complete": result.get("analysisComplete", False)
+        "function_count": stats.get("functionCount"),
+        "symbol_count": stats.get("symbolCount")
     }
     
     # Add project information if available
@@ -1322,7 +1727,7 @@ def ghidra_instance(port: int = None) -> dict:
     return instance_info
 
 @mcp.resource(uri="/instance/{port}/function/decompile/address/{address}")
-def decompiled_function_by_address(port: int = None, address: str = None) -> str:
+def decompiled_function_by_address(port: int | None = None, address: str | None = None) -> str:
     """Get decompiled C code for a function by address
     
     Args:
@@ -1364,14 +1769,14 @@ def decompiled_function_by_address(port: int = None, address: str = None) -> str
     
     # Different endpoints may return the code in different fields, try all of them
     if isinstance(result, dict):
-        for key in ["decompiled_text", "ccode", "decompiled"]:
+        for key in ["decompiled_text", "decompilation", "ccode", "decompiled"]:
             if key in result:
                 return result[key]
     
     return "Error: Could not extract decompiled code from response"
 
 @mcp.resource(uri="/instance/{port}/function/decompile/name/{name}")
-def decompiled_function_by_name(port: int = None, name: str = None) -> str:
+def decompiled_function_by_name(port: int | None = None, name: str | None = None) -> str:
     """Get decompiled C code for a function by name
     
     Args:
@@ -1413,14 +1818,14 @@ def decompiled_function_by_name(port: int = None, name: str = None) -> str:
     
     # Different endpoints may return the code in different fields, try all of them
     if isinstance(result, dict):
-        for key in ["decompiled_text", "ccode", "decompiled"]:
+        for key in ["decompiled_text", "decompilation", "ccode", "decompiled"]:
             if key in result:
                 return result[key]
     
     return "Error: Could not extract decompiled code from response"
 
 @mcp.resource(uri="/instance/{port}/function/info/address/{address}")
-def function_info_by_address(port: int = None, address: str = None) -> dict:
+def function_info_by_address(port: int | None = None, address: str | None = None) -> dict:
     """Get detailed information about a function by address
     
     Args:
@@ -1464,7 +1869,7 @@ def function_info_by_address(port: int = None, address: str = None) -> dict:
     return simplified["result"]
 
 @mcp.resource(uri="/instance/{port}/function/info/name/{name}")
-def function_info_by_name(port: int = None, name: str = None) -> dict:
+def function_info_by_name(port: int | None = None, name: str | None = None) -> dict:
     """Get detailed information about a function by name
     
     Args:
@@ -1508,7 +1913,7 @@ def function_info_by_name(port: int = None, name: str = None) -> dict:
     return simplified["result"]
 
 @mcp.resource(uri="/instance/{port}/function/disassembly/address/{address}")
-def disassembly_by_address(port: int = None, address: str = None) -> str:
+def disassembly_by_address(port: int | None = None, address: str | None = None) -> str:
     """Get disassembled instructions for a function by address
     
     Args:
@@ -1568,7 +1973,7 @@ def disassembly_by_address(port: int = None, address: str = None) -> str:
     return "Error: Could not extract disassembly from response"
 
 @mcp.resource(uri="/instance/{port}/function/disassembly/name/{name}")
-def disassembly_by_name(port: int = None, name: str = None) -> str:
+def disassembly_by_name(port: int | None = None, name: str | None = None) -> str:
     """Get disassembled instructions for a function by name
     
     Args:
@@ -1636,7 +2041,6 @@ class ProgramInfo(BaseModel):
     language: str = ""
     compiler: str = ""
     base_address: str = ""
-    memory_size: int = 0
     project: str = ""
 
 class FunctionContext(BaseModel):
@@ -1662,28 +2066,37 @@ def _build_program_info(port: int) -> ProgramInfo:
     info = ghidra_instance(port=port)
     return ProgramInfo(
         port=port,
-        url=info.get("url", ""),
-        program_name=info.get("file", ""),
-        language=info.get("architecture", ""),
-        project=info.get("project", ""),
+        url=info.get("url") or "",
+        program_name=info.get("program_name") or "",
+        language=info.get("language") or "",
+        compiler=info.get("compiler") or "",
+        base_address=info.get("base_address") or "",
+        project=info.get("project") or "",
     )
 
 
-def _build_function_context(port: int, name: str) -> FunctionContext:
-    func_info = simplify_response(safe_get(port, f"functions/by-name/{quote(name)}"))
-    result = func_info.get("result", {}) if isinstance(func_info, dict) else {}
+def _build_function_context(port: int, name: str | None = None,
+                            address: str | None = None) -> FunctionContext:
+    if address:
+        fn_info = function_info_by_address(port=port, address=address)
+        decompiled = decompiled_function_by_address(port=port, address=address)
+        disasm = disassembly_by_address(port=port, address=address)
+    else:
+        fn_info = function_info_by_name(port=port, name=name)
+        decompiled = decompiled_function_by_name(port=port, name=name)
+        disasm = disassembly_by_name(port=port, name=name)
 
-    decompile = simplify_response(safe_get(port, f"functions/by-name/{quote(name)}/decompile"))
-    decomp_result = decompile.get("result", {}) if isinstance(decompile, dict) else {}
+    info = fn_info if isinstance(fn_info, dict) and "error" not in fn_info else {}
 
     return FunctionContext(
-        name=name,
-        address=result.get("address", ""),
-        decompiled_code=decomp_result.get("decompiled", ""),
-        signature=result.get("signature", ""),
-        calling_convention=result.get("callingConvention", ""),
-        return_type=result.get("returnType", ""),
-        parameters=result.get("parameters", []),
+        name=info.get("name") or name or address or "",
+        address=info.get("address") or address or "",
+        decompiled_code=decompiled if isinstance(decompiled, str) else "",
+        disassembly=disasm if isinstance(disasm, str) else "",
+        signature=info.get("signature") or "",
+        calling_convention=info.get("callingConvention") or "",
+        return_type=info.get("returnType") or "",
+        parameters=info.get("parameters") or [],
     )
 
 
@@ -1691,17 +2104,18 @@ def _build_function_context(port: int, name: str) -> FunctionContext:
 # Prompts define reusable templates for LLM interactions
 
 @mcp.prompt("analyze_function")
-def analyze_function_prompt(function_name: str, port: int = None) -> str:
+def analyze_function_prompt(name: str | None = None, address: str | None = None, port: int | None = None) -> str:
     """Analyze a function in the current binary with decompiled code and metadata
 
     Args:
-        function_name: Function name to analyze
+        name: Function fully-qualified name (e.g. "FOM::Read"; a bare name matches the global namespace only), mutually exclusive with address
+        address: Function address in hex format (mutually exclusive with name)
         port: Specific Ghidra instance port (optional)
     """
     port = _get_instance_port(port)
-    ctx = _build_function_context(port, function_name)
+    ctx = _build_function_context(port, name=name, address=address)
     prog = _build_program_info(port)
-    return f"""Analyze the function '{function_name}' in {prog.program_name}.
+    return f"""Analyze the function '{ctx.name}' in {prog.program_name}.
 
 {ctx.format_info()}
 
@@ -1709,20 +2123,22 @@ Please provide:
 1. Purpose and behavior summary
 2. Parameter analysis
 3. Return value analysis
-4. Notable patterns or issues"""
+4. Notable patterns or issues
+5. Any security concerns in this implementation"""
 
 @mcp.prompt("identify_vulnerabilities")
-def identify_vulnerabilities_prompt(function_name: str, port: int = None) -> str:
+def identify_vulnerabilities_prompt(name: str | None = None, address: str | None = None, port: int | None = None) -> str:
     """Identify potential security vulnerabilities in a function
 
     Args:
-        function_name: Function name to analyze for vulnerabilities
+        name: Function fully-qualified name (e.g. "FOM::Read"; a bare name matches the global namespace only), mutually exclusive with address
+        address: Function address in hex format (mutually exclusive with name)
         port: Specific Ghidra instance port (optional)
     """
     port = _get_instance_port(port)
-    ctx = _build_function_context(port, function_name)
+    ctx = _build_function_context(port, name=name, address=address)
     prog = _build_program_info(port)
-    return f"""Analyze the function '{function_name}' in {prog.program_name} for security vulnerabilities.
+    return f"""Analyze the function '{ctx.name}' in {prog.program_name} for security vulnerabilities.
 
 {ctx.format_info()}
 
@@ -1743,7 +2159,7 @@ For each potential vulnerability:
 - Recommend a fix"""
 
 @mcp.prompt("reverse_engineer_binary")
-def reverse_engineer_binary_prompt(port: int = None) -> str:
+def reverse_engineer_binary_prompt(port: int | None = None) -> str:
     """A comprehensive prompt to guide the process of reverse engineering an entire binary
 
     Args:
@@ -1858,7 +2274,7 @@ def instances_list() -> dict:
 
 @mcp.tool()
 @text_output
-def instances_discover(host: str = None) -> dict:
+def instances_discover(host: str | None = None) -> dict:
     """Scan a specific host for Ghidra instances (RARELY NEEDED)
 
     Use this ONLY when scanning a different host than the default.
@@ -1891,7 +2307,7 @@ def instances_discover(host: str = None) -> dict:
 
 @mcp.tool()
 @text_output
-def instances_register(port: int, url: str = None) -> str:
+def instances_register(port: int, url: str | None = None) -> str:
     """Register a new Ghidra instance
     
     Args:
@@ -1963,90 +2379,16 @@ def instances_current() -> dict:
     """
     return ghidra_instance(port=current_instance_port)
 
-
-# Multi-file management tools
-
-@mcp.tool()
-@text_output
-def programs_list_open(port: int = None) -> dict:
-    """List all currently open programs/files in the Ghidra instance
-
-    Use this to see which binaries are open and which one is the active/current program.
-    Each program can be targeted by name using the 'program' parameter in other tools.
-
-    Args:
-        port: Specific Ghidra instance port (optional)
-
-    Returns:
-        dict: List of open programs with name, path, language, and isCurrent flag
-    """
-    port = _get_instance_port(port)
-    return simplify_response(safe_get(port, "programs/open-programs"))
-
-
-@mcp.tool()
-@text_output
-def programs_open(path: str, port: int = None) -> dict:
-    """Open a project file as a program in the current Ghidra instance
-
-    Opens a binary from the Ghidra project without switching away from the current program.
-    Use project_list_files() to see available files.
-
-    Args:
-        path: Path to the file within the Ghidra project (e.g. "/malware.exe")
-        port: Specific Ghidra instance port (optional)
-
-    Returns:
-        dict: Information about the opened program
-    """
-    port = _get_instance_port(port)
-    return simplify_response(safe_post(port, "programs/open", {"path": path}))
-
-
-@mcp.tool()
-@text_output
-def programs_close(name: str, port: int = None) -> dict:
-    """Close an open program in the Ghidra instance
-
-    Args:
-        name: Name of the program to close (as shown by programs_list_open)
-        port: Specific Ghidra instance port (optional)
-
-    Returns:
-        dict: Confirmation that the program was closed
-    """
-    port = _get_instance_port(port)
-    return simplify_response(safe_post(port, "programs/close", {"name": name}))
-
-
-@mcp.tool()
-@text_output
-def programs_switch(name: str, port: int = None) -> dict:
-    """Switch the active/current program in the Ghidra instance
-
-    Changes which program is the default for all operations.
-    Alternatively, pass ?program=name to any tool to target a specific program
-    without switching.
-
-    Args:
-        name: Name of the program to switch to (must be already open)
-        port: Specific Ghidra instance port (optional)
-
-    Returns:
-        dict: Confirmation that the active program was switched
-    """
-    port = _get_instance_port(port)
-    return simplify_response(safe_post(port, "programs/switch", {"name": name}))
-
-
 # Function tools
 @mcp.tool()
 @text_output
 def functions_list(offset: int = 0, limit: int = 100,
-                  name_contains: str = None,
-                  name_matches_regex: str = None,
-                  program: str = None,
-                  port: int = None) -> dict:
+                  name_contains: str | None = None,
+                  name_matches_regex: str | None = None,
+                  addr_min: str | None = None,
+                  addr_max: str | None = None,
+                  program: str | None = None,
+                  port: int | None = None) -> dict:
     """List functions with filtering and pagination
 
     Args:
@@ -2054,6 +2396,8 @@ def functions_list(offset: int = 0, limit: int = 100,
         limit: Maximum items to return (default: 100)
         name_contains: Substring name filter (case-insensitive)
         name_matches_regex: Regex name filter
+        addr_min: Only return functions at or above this address (hex)
+        addr_max: Only return functions at or below this address (hex)
         program: Target a specific open program by name (multi-file support)
         port: Specific Ghidra instance port (optional)
 
@@ -2070,29 +2414,33 @@ def functions_list(offset: int = 0, limit: int = 100,
         params["name_contains"] = name_contains
     if name_matches_regex:
         params["name_matches_regex"] = name_matches_regex
+    if addr_min:
+        params["addr_min"] = addr_min
+    if addr_max:
+        params["addr_max"] = addr_max
 
     response = safe_get(port, "functions", params, program=program)
     simplified = simplify_response(response)
-    
-    # Ensure we maintain pagination metadata
+
     if isinstance(simplified, dict) and "error" not in simplified:
         simplified.setdefault("size", len(simplified.get("result", [])))
         simplified.setdefault("offset", offset)
         simplified.setdefault("limit", limit)
-    
+
     return simplified
 
 @mcp.tool()
 @text_output
-def functions_get(name: str = None, address: str = None, program: str = None, port: int = None) -> dict:
+def functions_get(name: str | None = None, address: str | None = None, program: str | None = None,
+                  port: int | None = None) -> dict:
     """Get detailed information about a function
-
+    
     Args:
-        name: Function name (mutually exclusive with address)
+        name: Function fully-qualified name (e.g. "FOM::Read"; a bare name matches the global namespace only), mutually exclusive with address
         address: Function address in hex format (mutually exclusive with name)
         program: Target a specific open program by name (multi-file support)
         port: Specific Ghidra instance port (optional)
-
+        
     Returns:
         dict: Detailed function information
     """
@@ -2105,34 +2453,88 @@ def functions_get(name: str = None, address: str = None, program: str = None, po
             },
             "timestamp": int(time.time() * 1000)
         }
-
+    
     port = _get_instance_port(port)
-
+    
     if address:
         endpoint = f"functions/{address}"
     else:
-        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}"
-
+    
     response = safe_get(port, endpoint, program=program)
     return simplify_response(response)
 
 @mcp.tool()
 @text_output
-def functions_decompile(name: str = None, address: str = None,
+def functions_get_containing(address: str, port: int | None = None) -> dict:
+    """Find the function containing the specified address
+
+    Args:
+        address: Memory address in hex format
+        port: Specific Ghidra instance port (optional)
+        
+    Returns:
+        dict: List containing the function information if found
+    """
+    port = _get_instance_port(port)
+    
+    params = {
+        "containing_addr": address
+    }
+    
+    response = safe_get(port, "functions", params)
+    return simplify_response(response)
+
+@mcp.tool()
+@text_output
+def functions_get_next(address: str, port: int | None = None) -> dict:
+    """Get the next function after the given address (by memory order)
+
+    Args:
+        address: Reference address in hex format
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Function immediately after the given address, or empty result if none
+    """
+    port = _get_instance_port(port)
+    response = safe_get(port, "functions", {"after": address})
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def functions_get_prev(address: str, port: int | None = None) -> dict:
+    """Get the previous function before the given address (by memory order)
+
+    Args:
+        address: Reference address in hex format
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Function immediately before the given address, or empty result if none
+    """
+    port = _get_instance_port(port)
+    response = safe_get(port, "functions", {"before": address})
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def functions_decompile(name: str | None = None, address: str | None = None,
                         syntax_tree: bool = False, style: str = "normalize",
-                        show_constants: bool = True, timeout: int = 30,
-                        start_line: int = None, end_line: int = None, max_lines: int = None,
-                        program: str = None, port: int = None) -> dict:
+                        show_constants: bool = True, timeout: int = DEFAULT_DECOMPILATION_TIMEOUT,
+                        start_line: int | None = None, end_line: int | None = None, max_lines: int | None = None,
+                        program: str | None = None, port: int | None = None) -> dict:
     """Get decompiled code for a function with optional line filtering and configurable options
 
     Args:
-        name: Function name (mutually exclusive with address)
+        name: Function fully-qualified name (e.g. "FOM::Read"; a bare name matches the global namespace only), mutually exclusive with address
         address: Function address in hex format (mutually exclusive with name)
         syntax_tree: Include syntax tree (default: False)
         style: Decompiler style (default: "normalize")
         show_constants: Show actual constant values (strings, numbers) instead of placeholder addresses (default: True)
-        timeout: Decompilation timeout in seconds (default: 30)
+        timeout: Decompilation timeout in seconds (default: GHIDRA_DECOMP_TIMEOUT or auto default)
         start_line: Start at this line number (1-indexed, optional)
         end_line: End at this line number (inclusive, optional)
         max_lines: Maximum number of lines to return (optional, takes precedence over end_line)
@@ -2183,7 +2585,6 @@ def functions_decompile(name: str = None, address: str = None,
     if address:
         endpoint = f"functions/{address}/decompile"
     else:
-        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}/decompile"
 
     response = safe_get(port, endpoint, params, program=program)
@@ -2193,14 +2594,16 @@ def functions_decompile(name: str = None, address: str = None,
 
 @mcp.tool()
 @text_output
-def functions_disassemble(name: str = None, address: str = None, offset: int = 0, limit: int = 0, port: int = None) -> dict:
+def functions_disassemble(name: str | None = None, address: str | None = None, offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """Get disassembly for a function
 
     Args:
-        name: Function name (mutually exclusive with address)
+        name: Function fully-qualified name (e.g. "FOM::Read"; a bare name matches the global namespace only), mutually exclusive with address
         address: Function address in hex format (mutually exclusive with name)
         offset: Number of instructions to skip (default 0)
-        limit: Maximum number of instructions to return (default 0 = all)
+        limit: Maximum number of instructions per page (default 100, server max 1000).
+            Long functions are paginated; the text output footer reports the total
+            instruction count and the next offset to fetch the rest.
         port: Specific Ghidra instance port (optional)
 
     Returns:
@@ -2221,10 +2624,9 @@ def functions_disassemble(name: str = None, address: str = None, offset: int = 0
     if address:
         endpoint = f"functions/{address}/disassembly"
     else:
-        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}/disassembly"
 
-    params: Dict[str, Any] = {}
+    params = {}
     if offset > 0:
         params["offset"] = offset
     if limit > 0:
@@ -2235,7 +2637,7 @@ def functions_disassemble(name: str = None, address: str = None, offset: int = 0
 
 @mcp.tool()
 @text_output
-def functions_create(address: str, port: int = None) -> dict:
+def functions_create(address: str, port: int | None = None) -> dict:
     """Create a new function at the specified address
     
     Args:
@@ -2266,13 +2668,13 @@ def functions_create(address: str, port: int = None) -> dict:
 
 @mcp.tool()
 @text_output
-def functions_rename(old_name: str = None, address: str = None, new_name: str = "", port: int = None) -> dict:
+def functions_rename(old_name: str | None = None, address: str | None = None, new_name: str = "", port: int | None = None) -> dict:
     """Rename a function
     
     Args:
-        old_name: Current function name (mutually exclusive with address)
+        old_name: Current fully-qualified function name (e.g. "FOM::Read"; bare = global only), mutually exclusive with address
         address: Function address in hex format (mutually exclusive with name)
-        new_name: New function name
+        new_name: New fully-qualified name; "A::B::foo" moves into namespace A::B (created if absent), a leading "::" or "Global::" moves to the global namespace, a bare name keeps the current namespace
         port: Specific Ghidra instance port (optional)
         
     Returns:
@@ -2297,19 +2699,18 @@ def functions_rename(old_name: str = None, address: str = None, new_name: str = 
     if address:
         endpoint = f"functions/{address}"
     else:
-        assert old_name is not None
         endpoint = f"functions/by-name/{quote(old_name)}"
-
+    
     response = safe_patch(port, endpoint, payload)
     return simplify_response(response)
 
 @mcp.tool()
 @text_output
-def functions_set_signature(name: str = None, address: str = None, signature: str = "", port: int = None) -> dict:
+def functions_set_signature(name: str | None = None, address: str | None = None, signature: str = "", port: int | None = None) -> dict:
     """Set function signature/prototype
     
     Args:
-        name: Function name (mutually exclusive with address)
+        name: Function fully-qualified name (e.g. "FOM::Read"; a bare name matches the global namespace only), mutually exclusive with address
         address: Function address in hex format (mutually exclusive with name)
         signature: New function signature (e.g., "int func(char *data, int size)")
         port: Specific Ghidra instance port (optional)
@@ -2336,19 +2737,100 @@ def functions_set_signature(name: str = None, address: str = None, signature: st
     if address:
         endpoint = f"functions/{address}"
     else:
-        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}"
-
+    
     response = safe_patch(port, endpoint, payload)
     return simplify_response(response)
 
 @mcp.tool()
 @text_output
-def functions_get_variables(name: str = None, address: str = None, port: int = None) -> dict:
+def functions_delete(name: str | None = None, address: str | None = None, port: int | None = None) -> dict:
+    """Delete a function
+
+    Args:
+        name: Function fully-qualified name (e.g. "FOM::Read"; a bare name matches the global namespace only), mutually exclusive with address
+        address: Function address in hex format (mutually exclusive with name)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Operation result with deletion status
+    """
+    if not name and not address:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "Either name or address parameter is required"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
+    port = _get_instance_port(port)
+
+    if address:
+        endpoint = f"functions/{address}"
+    else:
+        endpoint = f"functions/by-name/{quote(name)}"
+
+    response = safe_delete(port, endpoint)
+    return simplify_response(response)
+
+@mcp.tool()
+@text_output
+def functions_update_variable(address: str, variable_name: str,
+                              new_name: str | None = None, new_data_type: str | None = None,
+                              port: int | None = None) -> dict:
+    """Update a local variable in a function
+
+    Args:
+        address: Function address in hex format
+        variable_name: Existing variable name
+        new_name: New variable name (optional)
+        new_data_type: New variable data type (optional)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Operation result
+    """
+    if not address or not variable_name:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "address and variable_name parameters are required"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
+    if not new_name and not new_data_type:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "At least one of new_name or new_data_type must be provided"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
+    port = _get_instance_port(port)
+
+    payload = {}
+    if new_name:
+        payload["name"] = new_name
+    if new_data_type:
+        payload["data_type"] = new_data_type
+
+    endpoint = f"functions/{address}/variables/{quote(variable_name)}"
+    response = safe_patch(port, endpoint, payload)
+    return simplify_response(response)
+
+@mcp.tool()
+@text_output
+def functions_get_variables(name: str | None = None, address: str | None = None, port: int | None = None) -> dict:
     """Get variables for a function
     
     Args:
-        name: Function name (mutually exclusive with address)
+        name: Function fully-qualified name (e.g. "FOM::Read"; a bare name matches the global namespace only), mutually exclusive with address
         address: Function address in hex format (mutually exclusive with name)
         port: Specific Ghidra instance port (optional)
         
@@ -2370,22 +2852,23 @@ def functions_get_variables(name: str = None, address: str = None, port: int = N
     if address:
         endpoint = f"functions/{address}/variables"
     else:
-        assert name is not None
         endpoint = f"functions/by-name/{quote(name)}/variables"
-
+    
     response = safe_get(port, endpoint)
     return simplify_response(response)
 
 # Memory tools
 @mcp.tool()
 @text_output
-def memory_read(address: str, length: int = 16, format: str = "hex", port: int = None) -> dict:
+def memory_read(address: str, length: int = 16, format: str = "hex", segment: str | None = None,
+                port: int | None = None) -> dict:
     """Read bytes from memory
-    
+
     Args:
         address: Memory address in hex format
         length: Number of bytes to read (default: 16)
         format: Output format - "hex", "base64", or "string" (default: "hex")
+        segment: Optional memory segment/overlay name to qualify the address (e.g. "runtime")
         port: Specific Ghidra instance port (optional)
     
     Returns:
@@ -2409,43 +2892,51 @@ def memory_read(address: str, length: int = 16, format: str = "hex", port: int =
         }
 
     port = _get_instance_port(port)
-    
-    # Use query parameters instead of path parameters for more reliable handling
+
+    # GET /memory is the block list; the read endpoint is GET /memory/{address}.
     params = {
-        "address": address,
         "length": length,
         "format": format
     }
-    
-    response = safe_get(port, "memory", params)
+    if segment and ":" not in address:
+        address = f"{segment}:{address}"
+
+    response = safe_get(port, f"memory/{quote(address, safe=':')}", params)
     simplified = simplify_response(response)
-    
+
     # Ensure the result is simple and directly usable
     if "result" in simplified and isinstance(simplified["result"], dict):
         result = simplified["result"]
-        
-        # Pass through all representations of the bytes
+
         memory_info = {
-            "success": True, 
+            "success": True,
             "address": result.get("address", address),
-            "length": result.get("bytesRead", length),
+            "length": result.get("length", result.get("bytesRead", length)),
             "format": format,
             "timestamp": simplified.get("timestamp", int(time.time() * 1000))
         }
-        
-        # Include all the different byte representations
-        if "hexBytes" in result:
+
+        # Server sends "hex" (hex string) or "bytes" (int array); accept the
+        # legacy field names too for older plugin builds.
+        if "hex" in result:
+            memory_info["hexBytes"] = result["hex"]
+        elif "hexBytes" in result:
             memory_info["hexBytes"] = result["hexBytes"]
+        if "bytes" in result:
+            memory_info["bytes"] = result["bytes"]
         if "rawBytes" in result:
             memory_info["rawBytes"] = result["rawBytes"]
-            
+        if "block" in result:
+            memory_info["block"] = result["block"]
+            memory_info["permissions"] = result.get("permissions")
+
         return memory_info
-    
+
     return simplified
 
 @mcp.tool()
 @text_output
-def memory_write(address: str, bytes_data: str, format: str = "hex", port: int = None) -> dict:
+def memory_write(address: str, bytes_data: str, format: str = "hex", port: int | None = None) -> dict:
     """Write bytes to memory (use with caution)
     
     Args:
@@ -2478,19 +2969,42 @@ def memory_write(address: str, bytes_data: str, format: str = "hex", port: int =
         }
 
     port = _get_instance_port(port)
-    
+
+    # The server only understands hex (it strips non-hex chars from the payload,
+    # which would silently corrupt base64/string input). Convert client-side.
+    if format == "base64":
+        try:
+            bytes_data = base64.b64decode(bytes_data).hex()
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INVALID_BASE64", "message": f"Invalid base64 data: {e}"},
+                "timestamp": int(time.time() * 1000)
+            }
+    elif format == "string":
+        bytes_data = bytes_data.encode("utf-8").hex()
+    elif format == "hex":
+        cleaned = bytes_data.replace(" ", "")
+        if len(cleaned) % 2 != 0 or any(c not in "0123456789abcdefABCDEF" for c in cleaned):
+            return {
+                "success": False,
+                "error": {"code": "INVALID_HEX", "message": "bytes_data must be an even-length hex string"},
+                "timestamp": int(time.time() * 1000)
+            }
+        bytes_data = cleaned
+
     payload = {
         "bytes": bytes_data,
-        "format": format
+        "format": "hex"
     }
-    
+
     # Memory write is handled by ProgramEndpoints, not MemoryEndpoints
     response = safe_patch(port, f"programs/current/memory/{address}", payload)
     return simplify_response(response)
 
 @mcp.tool()
 @text_output
-def memory_disassemble(address: str, limit: int = 50, offset: int = 0, port: int = None) -> dict:
+def memory_disassemble(address: str, limit: int = 50, offset: int = 0, port: int | None = None) -> dict:
     """Disassemble instructions at an arbitrary address (not tied to a function)
 
     Args:
@@ -2524,8 +3038,8 @@ def memory_disassemble(address: str, limit: int = 50, offset: int = 0, port: int
 # Xrefs tools
 @mcp.tool()
 @text_output
-def xrefs_list(to_addr: str = None, from_addr: str = None, type: str = None,
-              offset: int = 0, limit: int = 100, port: int = None) -> dict:
+def xrefs_list(to_addr: str | None = None, from_addr: str | None = None, type: str | None = None,
+              offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """List cross-references with filtering and pagination
     
     Args:
@@ -2577,10 +3091,10 @@ def xrefs_list(to_addr: str = None, from_addr: str = None, type: str = None,
 # Data tools
 @mcp.tool()
 @text_output
-def data_list(offset: int = 0, limit: int = 100, addr: str = None,
-            name: str = None, name_contains: str = None, type: str = None,
-            port: int = None) -> dict:
-    """List defined data items with filtering and pagination
+def data_list(offset: int = 0, limit: int = 100, addr: str | None = None,
+            name: str | None = None, name_contains: str | None = None, type: str | None = None,
+            port: int | None = None) -> dict:
+    """List data items with filtering and pagination
     
     Args:
         offset: Pagination offset (default: 0)
@@ -2592,20 +3106,32 @@ def data_list(offset: int = 0, limit: int = 100, addr: str = None,
         port: Specific Ghidra instance port (optional)
     
     Returns:
-        dict: Data items matching the filters
+        dict: Data items matching the filters. For address lookups, returns
+              defined data first and falls back to symbol labels if no defined
+              data exists at that address.
     """
     port = _get_instance_port(port)
     
+    # Address lookup has its own route; the /data list filters are label-based.
+    if addr:
+        response = safe_get(port, f"data/{quote(addr)}", {})
+        simplified = simplify_response(response)
+        if isinstance(simplified, dict) and simplified.get("success") and "result" in simplified:
+            # normalize single item to a list so formatters keep working
+            if isinstance(simplified["result"], dict):
+                simplified["result"] = [simplified["result"]]
+            simplified.setdefault("size", len(simplified["result"]))
+        return simplified
+
     params = {
         "offset": offset,
         "limit": limit
     }
-    if addr:
-        params["addr"] = addr
+    # Server filters are label/label_contains; map the friendlier arg names.
     if name:
-        params["name"] = name
+        params["label"] = name
     if name_contains:
-        params["name_contains"] = name_contains
+        params["label_contains"] = name_contains
     if type:
         params["type"] = type
 
@@ -2622,7 +3148,7 @@ def data_list(offset: int = 0, limit: int = 100, addr: str = None,
 
 @mcp.tool()
 @text_output
-def data_create(address: str, data_type: str, size: int = None, port: int = None) -> dict:
+def data_create(address: str, data_type: str, size: int | None = None, port: int | None = None) -> dict:
     """Define a new data item at the specified address
     
     Args:
@@ -2655,7 +3181,7 @@ def data_create(address: str, data_type: str, size: int = None, port: int = None
 
 @mcp.tool()
 @text_output
-def data_list_strings(offset: int = 0, limit: int = 2000, filter: str = None, port: int = None) -> dict:
+def data_list_strings(offset: int = 0, limit: int = 2000, filter: str | None = None, port: int | None = None) -> dict:
     """List all defined strings in the binary with their memory addresses
     
     Args:
@@ -2682,7 +3208,7 @@ def data_list_strings(offset: int = 0, limit: int = 2000, filter: str = None, po
 
 @mcp.tool()
 @text_output
-def data_rename(address: str, name: str, port: int = None) -> dict:
+def data_rename(address: str, name: str, port: int | None = None) -> dict:
     """Rename a data item
     
     Args:
@@ -2710,7 +3236,7 @@ def data_rename(address: str, name: str, port: int = None) -> dict:
 
 @mcp.tool()
 @text_output
-def data_delete(address: str, port: int = None) -> dict:
+def data_delete(address: str, port: int | None = None) -> dict:
     """Delete data at the specified address
     
     Args:
@@ -2737,7 +3263,7 @@ def data_delete(address: str, port: int = None) -> dict:
 
 @mcp.tool()
 @text_output
-def data_set_type(address: str, data_type: str, port: int = None) -> dict:
+def data_set_type(address: str, data_type: str, port: int | None = None) -> dict:
     """Set the data type of a data item
     
     Args:
@@ -2763,10 +3289,49 @@ def data_set_type(address: str, data_type: str, port: int = None) -> dict:
     response = safe_patch(port, f"data/{address}/type", {"type": data_type})
     return simplify_response(response)
 
+# Scalar tools
+@mcp.tool()
+@text_output
+def scalars_search(value: str, in_function: str | None = None, to_function: str | None = None,
+                   offset: int = 0, limit: int = 100, program: str | None = None,
+                   port: int | None = None) -> dict:
+    """Search for occurrences of a specific scalar (constant) value in instructions
+
+    Finds where a constant appears as an instruction operand, like Ghidra's "Search For
+    Scalars". For a named constant, resolve its value with data_list / datatypes first.
+
+    Args:
+        value: The scalar value to search for (hex "0x..." or decimal)
+        in_function: Only matches inside functions whose name contains this substring
+            (case-insensitive). Strongly preferred on large binaries: it scans only the
+            matching functions instead of the whole program.
+        to_function: Only matches where the instruction feeds a nearby call to a function
+            whose name contains this substring (e.g. find the 0 passed to memset).
+        offset: Pagination offset (default: 0)
+        limit: Maximum items to return (default: 100)
+        program: Target a specific open program by name (multi-file support)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Scalar occurrences with address, instruction, and function context. On a large
+        program an unfiltered or to_function search may report scanTruncated when it hits a
+        time budget; narrow it with in_function for complete results.
+    """
+    port = _get_instance_port(port)
+
+    params = {"value": value, "offset": offset, "limit": limit}
+    if in_function:
+        params["in_function"] = in_function
+    if to_function:
+        params["to_function"] = to_function
+
+    response = safe_get(port, "scalars", params, program=program)
+    return simplify_response(response)
+
 # Struct tools
 @mcp.tool()
 @text_output
-def structs_list(offset: int = 0, limit: int = 100, category: str = None, port: int = None) -> dict:
+def structs_list(offset: int = 0, limit: int = 100, category: str | None = None, port: int | None = None) -> dict:
     """List all struct data types in the program
 
     Args:
@@ -2800,7 +3365,7 @@ def structs_list(offset: int = 0, limit: int = 100, category: str = None, port: 
 
 @mcp.tool()
 @text_output
-def structs_get(name: str, port: int = None) -> dict:
+def structs_get(name: str, port: int | None = None) -> dict:
     """Get detailed information about a specific struct including all fields
 
     Args:
@@ -2827,12 +3392,14 @@ def structs_get(name: str, port: int = None) -> dict:
 
 @mcp.tool()
 @text_output
-def structs_create(name: str, category: str = None, description: str = None, port: int = None) -> dict:
+def structs_create(name: str, category: str | None = None, size: int | None = None,
+                   description: str | None = None, port: int | None = None) -> dict:
     """Create a new struct data type
 
     Args:
         name: Name for the new struct
         category: Category path for the struct (e.g. "/custom")
+        size: Optional initial struct size in bytes
         description: Optional description for the struct
         port: Specific Ghidra instance port (optional)
 
@@ -2854,6 +3421,8 @@ def structs_create(name: str, category: str = None, description: str = None, por
     payload = {"name": name}
     if category:
         payload["category"] = category
+    if size is not None:
+        payload["size"] = size
     if description:
         payload["description"] = description
 
@@ -2863,7 +3432,7 @@ def structs_create(name: str, category: str = None, description: str = None, por
 @mcp.tool()
 @text_output
 def structs_add_field(struct_name: str, field_name: str, field_type: str,
-                     offset: int = None, comment: str = None, port: int = None) -> dict:
+                     offset: int | None = None, comment: str | None = None, port: int | None = None) -> dict:
     """Add a field to an existing struct
 
     Args:
@@ -2903,9 +3472,9 @@ def structs_add_field(struct_name: str, field_name: str, field_type: str,
 
 @mcp.tool()
 @text_output
-def structs_update_field(struct_name: str, field_name: str = None, field_offset: int = None,
-                        new_name: str = None, new_type: str = None, new_comment: str = None,
-                        port: int = None) -> dict:
+def structs_update_field(struct_name: str, field_name: str | None = None, field_offset: int | None = None,
+                        new_name: str | None = None, new_type: str | None = None, new_comment: str | None = None,
+                        port: int | None = None) -> dict:
     """Update an existing field in a struct (change name, type, or comment)
 
     Args:
@@ -2968,7 +3537,7 @@ def structs_update_field(struct_name: str, field_name: str = None, field_offset:
 
 @mcp.tool()
 @text_output
-def structs_delete(name: str, port: int = None) -> dict:
+def structs_delete(name: str, port: int | None = None) -> dict:
     """Delete a struct data type
 
     Args:
@@ -2996,28 +3565,35 @@ def structs_delete(name: str, port: int = None) -> dict:
 # Analysis tools
 @mcp.tool()
 @text_output
-def analysis_run(port: int = None, analysis_options: dict = None) -> dict:
+def analysis_run(port: int | None = None, analysis_options: dict | None = None, background: bool | None = None) -> dict:
     """Run analysis on the current program
     
     Args:
         analysis_options: Dictionary of analysis options to enable/disable
-                         (e.g. {"functionRecovery": True, "dataRefs": False})
+                         (e.g. {"background": True, "functionRecovery": True})
+        background: Convenience override for background analysis execution
         port: Specific Ghidra instance port (optional)
     
     Returns:
         dict: Analysis operation result with status
     """
     port = _get_instance_port(port)
-    response = safe_post(port, "analysis", analysis_options or {})
+    payload = dict(analysis_options or {})
+    if background is not None:
+        payload["background"] = str(background).lower()
+    if "background" not in payload:
+        payload["background"] = "true"
+
+    response = safe_post(port, "analysis/run", payload)
     return simplify_response(response)
 
 @mcp.tool()
 @text_output
-def analysis_get_callgraph(name: str = None, address: str = None, max_depth: int = 3, port: int = None) -> dict:
+def analysis_get_callgraph(name: str | None = None, address: str | None = None, max_depth: int = 3, port: int | None = None) -> dict:
     """Get function call graph visualization data
 
     Args:
-        name: Starting function name (mutually exclusive with address)
+        name: Starting function fully-qualified name (e.g. "FOM::Read"; bare = global only), mutually exclusive with address
         address: Starting function address (mutually exclusive with name)
         max_depth: Maximum call depth to analyze (default: 3). Increase for deeper call chains (e.g., 10-15 for complex functions)
         port: Specific Ghidra instance port (optional)
@@ -3027,21 +3603,30 @@ def analysis_get_callgraph(name: str = None, address: str = None, max_depth: int
     """
     port = _get_instance_port(port)
     
-    params = {"max_depth": max_depth}
-    
+    # Server reads "depth"; send both for compatibility with older builds.
+    params = {"depth": max_depth, "max_depth": max_depth}
+
     # Explicitly pass either name or address parameter based on what was provided
     if address:
         params["address"] = address
     elif name:
         params["name"] = name
-    # If neither is provided, the Java endpoint will use the entry point
-    
+    else:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "Either name or address parameter is required"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
     response = safe_get(port, "analysis/callgraph", params)
     return simplify_response(response)
 
 @mcp.tool()
 @text_output
-def analysis_get_dataflow(address: str, direction: str = "forward", max_steps: int = 50, port: int = None) -> dict:
+def analysis_get_dataflow(address: str, direction: str = "forward", max_steps: int = 50, port: int | None = None) -> dict:
     """Perform data flow analysis from an address
     
     Args:
@@ -3076,7 +3661,7 @@ def analysis_get_dataflow(address: str, direction: str = "forward", max_steps: i
 
 @mcp.tool()
 @text_output
-def ui_get_current_address(port: int = None) -> dict:
+def ui_get_current_address(port: int | None = None) -> dict:
     """Get the address currently selected in Ghidra's UI
 
     Args:
@@ -3091,7 +3676,7 @@ def ui_get_current_address(port: int = None) -> dict:
 
 @mcp.tool()
 @text_output
-def ui_get_current_function(port: int = None) -> dict:
+def ui_get_current_function(port: int | None = None) -> dict:
     """Get the function currently selected in Ghidra's UI
 
     Args:
@@ -3106,7 +3691,7 @@ def ui_get_current_function(port: int = None) -> dict:
 
 @mcp.tool()
 @text_output
-def comments_set(address: str, comment: str = "", comment_type: str = "plate", port: int = None) -> dict:
+def comments_set(address: str, comment: str = "", comment_type: str = "plate", port: int | None = None) -> dict:
     """Set a comment at the specified address
 
     Args:
@@ -3138,7 +3723,34 @@ def comments_set(address: str, comment: str = "", comment_type: str = "plate", p
 
 @mcp.tool()
 @text_output
-def functions_set_comment(address: str, comment: str = "", port: int = None) -> dict:
+def comments_get(address: str, comment_type: str = "plate", port: int | None = None) -> dict:
+    """Get a comment at the specified address
+
+    Args:
+        address: Memory address in hex format
+        comment_type: Type of comment - "plate", "pre", "post", "eol", "repeatable"
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Operation result containing comment text
+    """
+    if not address:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "Address parameter is required"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
+    port = _get_instance_port(port)
+    response = safe_get(port, f"memory/{address}/comments/{comment_type}")
+    return simplify_response(response)
+
+@mcp.tool()
+@text_output
+def functions_set_comment(address: str, comment: str = "", port: int | None = None) -> dict:
     """Set a decompiler-friendly comment (tries function comment, falls back to pre-comment)
 
     Args:
@@ -3184,7 +3796,7 @@ def functions_set_comment(address: str, comment: str = "", port: int = None) -> 
 
 @mcp.tool()
 @text_output
-def project_info(port: int = None) -> dict:
+def project_info(port: int | None = None) -> dict:
     """Get information about the currently open Ghidra project
 
     Args:
@@ -3201,7 +3813,7 @@ def project_info(port: int = None) -> dict:
 @mcp.tool()
 @text_output
 def project_list_files(folder: str = "/", recursive: bool = True,
-                       offset: int = 0, limit: int = 100, port: int = None) -> dict:
+                       offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """List files in the current Ghidra project
 
     Args:
@@ -3229,7 +3841,7 @@ def project_list_files(folder: str = "/", recursive: bool = True,
 
 @mcp.tool()
 @text_output
-def project_open_file(path: str, port: int = None) -> dict:
+def project_open_file(path: str, port: int | None = None) -> dict:
     """Open a file from the project in CodeBrowser
 
     This will open the file in a new CodeBrowser window, creating a new instance.
@@ -3249,11 +3861,265 @@ def project_open_file(path: str, port: int = None) -> dict:
     return simplify_response(response)
 
 
+@mcp.tool()
+@text_output
+def projects_list(port: int | None = None) -> dict:
+    """List projects visible to the plugin context
+
+    Args:
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: List of projects
+    """
+    port = _get_instance_port(port)
+    response = safe_get(port, "projects")
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def projects_get(name: str, port: int | None = None) -> dict:
+    """Get a project by name
+
+    Args:
+        name: Project name
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Project details
+    """
+    if not name:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "name parameter is required"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
+    port = _get_instance_port(port)
+    response = safe_get(port, f"projects/{quote(name)}")
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def programs_list(project: str | None = None, offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
+    """List programs in the current project context
+
+    Args:
+        project: Optional project name filter
+        offset: Pagination offset (default: 0)
+        limit: Maximum items to return (default: 100)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: List of programs
+    """
+    port = _get_instance_port(port)
+    params = {"offset": offset, "limit": limit}
+    if project:
+        params["project"] = project
+    response = safe_get(port, "programs", params)
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def programs_get(program_id: str = "current", port: int | None = None) -> dict:
+    """Get program details by program ID or 'current'
+
+    Args:
+        program_id: Program ID (e.g. 'MyProj:/sample.bin') or 'current'
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Program details
+    """
+    port = _get_instance_port(port)
+    endpoint = "programs/current" if program_id == "current" else f"programs/{quote(program_id, safe='')}"
+    response = safe_get(port, endpoint)
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def programs_delete(program_id: str = "current", port: int | None = None) -> dict:
+    """Delete/close a program by program ID or 'current'
+
+    Args:
+        program_id: Program ID or 'current'
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Operation result
+    """
+    port = _get_instance_port(port)
+    endpoint = "programs/current" if program_id == "current" else f"programs/{quote(program_id, safe='')}"
+    response = safe_delete(port, endpoint)
+    return simplify_response(response)
+
+
+@mcp.tool()
+def programs_save(all: bool = False, port: int | None = None) -> dict:
+    """Save the current program to the project (Ghidra's "Save")
+
+    Persists analysis (renames, types, comments, etc.) so it survives a Ghidra restart.
+    A program with no changes is a no-op (saved=false).
+
+    Args:
+        all: Save every open program with unsaved changes (default: just the current program)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Save result(s); saved=false means there were no unsaved changes
+    """
+    port = _get_instance_port(port)
+    endpoint = "program/save?all=true" if all else "program/save"
+    response = safe_post(port, endpoint, {})
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def programs_list_open(port: int | None = None) -> dict:
+    """List all currently open programs/files in the Ghidra instance
+
+    Use this to see which binaries are open and which one is the active/current program.
+    Each program can be targeted by name using the 'program' parameter in other tools.
+
+    Args:
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: List of open programs with name, path, language, and isCurrent flag
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_get(port, "programs/open-programs"))
+
+
+@mcp.tool()
+@text_output
+def programs_open(path: str, port: int | None = None) -> dict:
+    """Open a project file as a program in the current Ghidra instance
+
+    Opens a binary from the Ghidra project without switching away from the current program.
+    Use project_list_files() to see available files.
+
+    Args:
+        path: Path to the file within the Ghidra project (e.g. "/malware.exe")
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Information about the opened program
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "programs/open", {"path": path}))
+
+
+@mcp.tool()
+@text_output
+def programs_close(name: str, discard: bool = False, port: int | None = None) -> dict:
+    """Close an open program in the Ghidra instance
+
+    A program with unsaved changes is not closed unless discard=True; save it first
+    with programs_save to keep the analysis.
+
+    Args:
+        name: Name of the program to close (as shown by programs_list_open)
+        discard: Close even if the program has unsaved changes, discarding them (default: False)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Confirmation that the program was closed
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "programs/close", {"name": name, "discard": discard}))
+
+
+@mcp.tool()
+@text_output
+def programs_switch(name: str, port: int | None = None) -> dict:
+    """Switch the active/current program in the Ghidra instance
+
+    Changes which program is the default for all operations.
+    Alternatively, pass program=name to tools that accept it to target a specific
+    program without switching.
+
+    Args:
+        name: Name of the program to switch to (must be already open)
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Confirmation that the active program was switched
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_post(port, "programs/switch", {"name": name}))
+
+
+# Script tools
+@mcp.tool()
+def scripts_list(port: int | None = None) -> dict:
+    """List Ghidra scripts available to run
+
+    Requires the server started with script execution enabled
+    (-Dghydra.dev.allowScripts=true or GHYDRA_ALLOW_SCRIPTS=1); otherwise returns 403.
+
+    Args:
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: List of scripts with name, path, category
+    """
+    port = _get_instance_port(port)
+    return simplify_response(safe_get(port, "scripts"))
+
+
+@mcp.tool()
+def scripts_run(name: str | None = None, source: str | None = None, args: list | None = None, port: int | None = None) -> dict:
+    """Run a Ghidra script: an existing one by name, or ad-hoc GhidraScript source
+
+    Use this for multi-stage or batch operations that would otherwise need many tool calls
+    (e.g. mass rename, signature transfer). Provide EITHER name OR source.
+
+    WARNING: this is arbitrary code execution. It requires the server started with
+    -Dghydra.dev.allowScripts=true (or GHYDRA_ALLOW_SCRIPTS=1); otherwise returns 403.
+
+    Args:
+        name: Name of an existing script (e.g. "MyScript.java")
+        source: Ad-hoc source: a full 'public class <Name> extends GhidraScript { public void
+            run() {...} }'. Use println(...) for output; currentProgram is the open program.
+        args: Optional list of string arguments (available via getScriptArgs()).
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: result with script, output (captured println text), success, error
+    """
+    if not name and not source:
+        return {
+            "success": False,
+            "error": {"code": "MISSING_PARAMETER", "message": "Either name or source is required"},
+            "timestamp": int(time.time() * 1000)
+        }
+
+    port = _get_instance_port(port)
+    payload = {}
+    if name:
+        payload["name"] = name
+    if source:
+        payload["source"] = source
+    if args:
+        payload["args"] = args
+    return simplify_response(safe_post(port, "scripts/run", payload))
+
+
 # ================= Analysis =================
 
 @mcp.tool()
 @text_output
-def analysis_status(port: int = None) -> dict:
+def analysis_status(port: int | None = None) -> dict:
     """Get analysis status for the current program
 
     Args:
@@ -3267,30 +4133,16 @@ def analysis_status(port: int = None) -> dict:
     return simplify_response(response)
 
 
-@mcp.tool()
-@text_output
-def analysis_run(background: bool = True, port: int = None) -> dict:
-    """Trigger auto-analysis on the current program
-
-    Args:
-        background: Run analysis in background (default: True)
-        port: Specific Ghidra instance port (optional)
-
-    Returns:
-        dict: Result of starting analysis
-    """
-    port = _get_instance_port(port)
-
-    data = {"background": str(background).lower()}
-    response = safe_post(port, "analysis/run", data)
-    return simplify_response(response)
+def _analysis_run_legacy(background: bool = True, port: int | None = None) -> dict:
+    """Legacy helper retained for backward compatibility inside this module."""
+    return analysis_run(port=port, background=background)
 
 
 # ================= Classes, Symbols, Segments, Namespaces, Variables, DataTypes =================
 
 @mcp.tool()
 @text_output
-def classes_list(offset: int = 0, limit: int = 100, port: int = None) -> dict:
+def classes_list(offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """List classes and namespaces in the program
 
     Args:
@@ -3314,7 +4166,7 @@ def classes_list(offset: int = 0, limit: int = 100, port: int = None) -> dict:
 
 @mcp.tool()
 @text_output
-def symbols_list(offset: int = 0, limit: int = 100, port: int = None) -> dict:
+def symbols_list(offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """List all symbols in the program
 
     Args:
@@ -3338,7 +4190,7 @@ def symbols_list(offset: int = 0, limit: int = 100, port: int = None) -> dict:
 
 @mcp.tool()
 @text_output
-def symbols_imports(offset: int = 0, limit: int = 100, port: int = None) -> dict:
+def symbols_imports(offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """List imported symbols (external function references)
 
     Args:
@@ -3362,7 +4214,7 @@ def symbols_imports(offset: int = 0, limit: int = 100, port: int = None) -> dict
 
 @mcp.tool()
 @text_output
-def symbols_exports(offset: int = 0, limit: int = 100, port: int = None) -> dict:
+def symbols_exports(offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """List exported symbols
 
     Args:
@@ -3386,7 +4238,7 @@ def symbols_exports(offset: int = 0, limit: int = 100, port: int = None) -> dict
 
 @mcp.tool()
 @text_output
-def segments_list(offset: int = 0, limit: int = 100, name: str = None, port: int = None) -> dict:
+def segments_list(offset: int = 0, limit: int = 100, name: str | None = None, port: int | None = None) -> dict:
     """List memory segments/blocks with permissions
 
     Args:
@@ -3413,7 +4265,7 @@ def segments_list(offset: int = 0, limit: int = 100, name: str = None, port: int
 
 @mcp.tool()
 @text_output
-def namespaces_list(offset: int = 0, limit: int = 100, port: int = None) -> dict:
+def namespaces_list(offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """List namespaces in the program
 
     Args:
@@ -3437,8 +4289,8 @@ def namespaces_list(offset: int = 0, limit: int = 100, port: int = None) -> dict
 
 @mcp.tool()
 @text_output
-def variables_list(offset: int = 0, limit: int = 100, search: str = None,
-                   global_only: bool = False, port: int = None) -> dict:
+def variables_list(offset: int = 0, limit: int = 100, search: str | None = None,
+                   global_only: bool = False, source: str = "database", port: int | None = None) -> dict:
     """List variables in the program
 
     Args:
@@ -3446,6 +4298,10 @@ def variables_list(offset: int = 0, limit: int = 100, search: str = None,
         limit: Maximum items to return (default: 100)
         search: Filter variables by name (optional)
         global_only: Only show global variables (default: False)
+        source: Local-variable source. "database" (default) reads committed locals/params
+            directly from the program DB - cheap, complete, exactly paginated (the "all
+            locals" view). "decompiler" runs the decompiler per function to surface inferred
+            locals - richer but slow and approximately paginated.
         port: Specific Ghidra instance port (optional)
 
     Returns:
@@ -3457,6 +4313,8 @@ def variables_list(offset: int = 0, limit: int = 100, search: str = None,
         params["search"] = search
     if global_only:
         params["global_only"] = "true"
+    if source and source != "database":
+        params["source"] = source
     response = safe_get(port, "variables", params)
     simplified = simplify_response(response)
     if isinstance(simplified, dict) and "error" not in simplified:
@@ -3468,8 +4326,8 @@ def variables_list(offset: int = 0, limit: int = 100, search: str = None,
 
 @mcp.tool()
 @text_output
-def datatypes_list(offset: int = 0, limit: int = 100, category: str = None,
-                   kind: str = None, port: int = None) -> dict:
+def datatypes_list(offset: int = 0, limit: int = 100, category: str | None = None,
+                   kind: str | None = None, port: int | None = None) -> dict:
     """List data types defined in the program
 
     Args:
@@ -3499,7 +4357,7 @@ def datatypes_list(offset: int = 0, limit: int = 100, category: str = None,
 
 @mcp.tool()
 @text_output
-def datatypes_search(name: str, offset: int = 0, limit: int = 100, port: int = None) -> dict:
+def datatypes_search(name: str, offset: int = 0, limit: int = 100, port: int | None = None) -> dict:
     """Search for data types by name
 
     Args:
@@ -3522,11 +4380,112 @@ def datatypes_search(name: str, offset: int = 0, limit: int = 100, port: int = N
     return simplified
 
 
+@mcp.tool()
+@text_output
+def datatypes_create_struct(name: str, category: str = "/", fields: list | None = None,
+                            port: int | None = None) -> dict:
+    """Create a struct datatype
+
+    Args:
+        name: Struct name
+        category: Category path (default: '/')
+        fields: Optional list of field objects, each with 'name', 'type', and optionally 'size', 'offset', 'comment'
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Created datatype info
+    """
+    if not name:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "name parameter is required"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
+    port = _get_instance_port(port)
+    payload = {"name": name, "category": category}
+    if fields:
+        payload["fields"] = fields
+    response = safe_post(port, "datatypes/struct", payload)
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def datatypes_create_enum(name: str, size: int = 4, category: str = "/", values: dict | None = None,
+                          port: int | None = None) -> dict:
+    """Create an enum datatype
+
+    Args:
+        name: Enum name
+        size: Enum storage size in bytes (default: 4)
+        category: Category path (default: '/')
+        values: Optional dict mapping enum value names to integer values, e.g. {"VALUE_A": 0, "VALUE_B": 1}
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Created datatype info
+    """
+    if not name:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "name parameter is required"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
+    port = _get_instance_port(port)
+    payload = {"name": name, "size": size, "category": category}
+    if values:
+        payload["values"] = values
+    response = safe_post(port, "datatypes/enum", payload)
+    return simplify_response(response)
+
+
+@mcp.tool()
+@text_output
+def datatypes_create_union(name: str, category: str = "/", fields: list | None = None,
+                           port: int | None = None) -> dict:
+    """Create a union datatype
+
+    Args:
+        name: Union name
+        category: Category path (default: '/')
+        fields: Optional list of field objects, each with 'name', 'type', and optionally 'size', 'comment'
+        port: Specific Ghidra instance port (optional)
+
+    Returns:
+        dict: Created datatype info
+    """
+    if not name:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "name parameter is required"
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+
+    port = _get_instance_port(port)
+    payload = {"name": name, "category": category}
+    if fields:
+        payload["fields"] = fields
+    response = safe_post(port, "datatypes/union", payload)
+    return simplify_response(response)
+
+
 # ================= Bookmark Tools =================
 
 @mcp.tool()
 @text_output
-def bookmarks_list(offset: int = 0, limit: int = 100, program: str = None, port: int = None) -> dict:
+def bookmarks_list(offset: int = 0, limit: int = 100, program: str | None = None,
+                   port: int | None = None) -> dict:
     """List all bookmarks in the program
 
     Args:
@@ -3546,7 +4505,8 @@ def bookmarks_list(offset: int = 0, limit: int = 100, program: str = None, port:
 @mcp.tool()
 @text_output
 def bookmarks_add(address: str, category: str = "", comment: str = "",
-                  bookmark_type: str = "Note", program: str = None, port: int = None) -> dict:
+                  bookmark_type: str = "Note", program: str | None = None,
+                  port: int | None = None) -> dict:
     """Add a bookmark at an address
 
     Args:
@@ -3572,7 +4532,7 @@ def bookmarks_add(address: str, category: str = "", comment: str = "",
 @mcp.tool()
 @text_output
 def bookmarks_delete(address: str, bookmark_type: str = "Note",
-                     program: str = None, port: int = None) -> dict:
+                     program: str | None = None, port: int | None = None) -> dict:
     """Delete a bookmark at an address
 
     Args:
@@ -3585,10 +4545,8 @@ def bookmarks_delete(address: str, bookmark_type: str = "Note",
         dict: Deletion confirmation
     """
     port = _get_instance_port(port)
-    return simplify_response(safe_post(port, "bookmarks/delete", {
-        "address": address,
-        "type": bookmark_type,
-    }, program=program))
+    return simplify_response(safe_delete(port, f"bookmarks/{address}",
+                                         params={"type": bookmark_type}, program=program))
 
 
 # ================= Memory Search Tools =================
@@ -3596,11 +4554,11 @@ def bookmarks_delete(address: str, bookmark_type: str = "Note",
 @mcp.tool()
 @text_output
 def memory_search_bytes(bytes_hex: str, offset: int = 0, limit: int = 20,
-                        program: str = None, port: int = None) -> dict:
+                        program: str | None = None, port: int | None = None) -> dict:
     """Search program memory for a byte pattern
 
     Args:
-        bytes_hex: Hex string to search for (e.g. "4D5A9000" for MZ header)
+        bytes_hex: Hex string to search for (e.g. "4D5A9000" for MZ header; spaces allowed)
         offset: Result pagination offset (default: 0)
         limit: Maximum results to return (default: 20)
         program: Target a specific open program by name (multi-file support)
@@ -3610,42 +4568,29 @@ def memory_search_bytes(bytes_hex: str, offset: int = 0, limit: int = 20,
         dict: List of matching addresses
     """
     port = _get_instance_port(port)
-    params = {"bytes": bytes_hex, "offset": offset, "limit": limit}
-    return simplify_response(safe_get(port, "memory/search", params, program=program))
+    offset = max(0, offset)
+    limit = max(1, limit)
+    params = {"pattern": bytes_hex, "max": offset + limit}
+    simplified = simplify_response(safe_get(port, "memory/search", params, program=program))
 
-
-# ================= Scalar Search Tools =================
-
-@mcp.tool()
-@text_output
-def scalars_search(value: str, in_function: str = None, to_function: str = None,
-                   offset: int = 0, limit: int = 100, program: str = None, port: int = None) -> dict:
-    """Search for scalar (constant) values in program instructions
-
-    Args:
-        value: Scalar value to search for (hex with 0x prefix or decimal)
-        in_function: Filter to scalars within this function (case-insensitive substring)
-        to_function: Filter to scalars passed as arguments to this function (case-insensitive substring)
-        offset: Pagination offset
-        limit: Maximum results
-        program: Target a specific open program by name (multi-file support)
-        port: Specific Ghidra instance port (optional)
-
-    Returns:
-        dict: Matching scalar locations with context
-    """
-    port = _get_instance_port(port)
-    params = {"value": value, "offset": offset, "limit": limit}
-    if in_function: params["in_function"] = in_function
-    if to_function: params["to_function"] = to_function
-    return simplify_response(safe_get(port, "scalars", params, program=program))
+    # The server returns the first `max` matches; slice out the requested page.
+    result = simplified.get("result") if isinstance(simplified, dict) else None
+    if isinstance(result, dict) and isinstance(result.get("matches"), list):
+        all_matches = result["matches"]
+        page = all_matches[offset:offset + limit]
+        result["matches"] = page
+        result["count"] = len(page)
+        result["offset"] = offset
+        result["limit"] = limit
+        result["hasMore"] = len(all_matches) >= offset + limit
+    return simplified
 
 
 # ================= Batch Operation Tools =================
 
 @mcp.tool()
 @text_output
-def batch_rename_functions(renames: list, program: str = None, port: int = None) -> dict:
+def batch_rename_functions(renames: list, program: str | None = None, port: int | None = None) -> dict:
     """Batch rename multiple functions in a single transaction
 
     Args:
@@ -3666,13 +4611,14 @@ def batch_rename_functions(renames: list, program: str = None, port: int = None)
 @mcp.tool()
 @text_output
 def batch_set_comments(comments: list, comment_type: str = "eol",
-                       program: str = None, port: int = None) -> dict:
+                       program: str | None = None, port: int | None = None) -> dict:
     """Batch set comments at multiple addresses in a single transaction
 
     Args:
-        comments: List of comment objects, each with 'address' and 'comment'.
+        comments: List of comment objects, each with 'address', 'comment' and an optional
+                  per-item 'type' that overrides comment_type.
                   Example: [{"address": "0x1000", "comment": "entry point"}, ...]
-        comment_type: Comment type for all comments - plate/pre/post/eol/repeatable (default: eol)
+        comment_type: Default comment type - plate/pre/post/eol/repeatable (default: eol)
         program: Target a specific open program by name (multi-file support)
         port: Specific Ghidra instance port (optional)
 
@@ -3688,7 +4634,7 @@ def batch_set_comments(comments: list, comment_type: str = "eol",
 
 @mcp.tool()
 @text_output
-def batch_define_data(items: list, program: str = None, port: int = None) -> dict:
+def batch_define_data(items: list, program: str | None = None, port: int | None = None) -> dict:
     """Batch define data items at multiple addresses in a single transaction
 
     Args:
@@ -3710,12 +4656,14 @@ def batch_define_data(items: list, program: str = None, port: int = None) -> dic
 
 @mcp.tool()
 @text_output
-def data_clear(address: str, size: int = 1, program: str = None, port: int = None) -> dict:
+def data_clear(address: str, size: int | None = None, program: str | None = None,
+               port: int | None = None) -> dict:
     """Clear/undefine data at an address, reverting bytes to undefined
 
     Args:
         address: Address to clear (hex format)
-        size: Number of bytes to clear (default: 1)
+        size: Number of bytes to clear starting at address (optional; by default the
+              whole data item or instruction at the address is cleared)
         program: Target a specific open program by name (multi-file support)
         port: Specific Ghidra instance port (optional)
 
@@ -3723,20 +4671,19 @@ def data_clear(address: str, size: int = 1, program: str = None, port: int = Non
         dict: Confirmation of the clear operation
     """
     port = _get_instance_port(port)
-    return simplify_response(safe_post(port, "data/clear", {
-        "address": address,
-        "size": size,
-    }, program=program))
+    params = {"size": size} if size is not None else None
+    return simplify_response(safe_delete(port, f"data/{address}", params=params, program=program))
 
 
 @mcp.tool()
 @text_output
-def data_create_label(address: str, name: str, program: str = None, port: int = None) -> dict:
+def data_create_label(address: str, name: str, program: str | None = None,
+                      port: int | None = None) -> dict:
     """Create a label at an arbitrary address
 
     Args:
         address: Address to label (hex format)
-        name: Label name
+        name: Label name (may be fully qualified, e.g. "ns::label")
         program: Target a specific open program by name (multi-file support)
         port: Specific Ghidra instance port (optional)
 
@@ -3744,7 +4691,7 @@ def data_create_label(address: str, name: str, program: str = None, port: int = 
         dict: Created label information
     """
     port = _get_instance_port(port)
-    return simplify_response(safe_post(port, "data/label", {
+    return simplify_response(safe_post(port, "symbols", {
         "address": address,
         "name": name,
     }, program=program))
@@ -3752,7 +4699,7 @@ def data_create_label(address: str, name: str, program: str = None, port: int = 
 
 @mcp.tool()
 @text_output
-def data_at_address(address: str, program: str = None, port: int = None) -> dict:
+def data_at_address(address: str, program: str | None = None, port: int | None = None) -> dict:
     """Get detailed information about data defined at a specific address
 
     Args:
@@ -3764,12 +4711,13 @@ def data_at_address(address: str, program: str = None, port: int = None) -> dict
         dict: Detailed data item information including type, value, size
     """
     port = _get_instance_port(port)
-    return simplify_response(safe_get(port, f"data/at/{address}", program=program))
+    return simplify_response(safe_get(port, f"data/{address}", program=program))
 
 
 @mcp.tool()
 @text_output
-def datatypes_apply(address: str, type_name: str, program: str = None, port: int = None) -> dict:
+def datatypes_apply(address: str, type_name: str, program: str | None = None,
+                    port: int | None = None) -> dict:
     """Apply a data type at a memory address (e.g. stamp a struct)
 
     Args:
@@ -3782,9 +4730,8 @@ def datatypes_apply(address: str, type_name: str, program: str = None, port: int
         dict: Result of the type application
     """
     port = _get_instance_port(port)
-    return simplify_response(safe_post(port, "datatypes/apply", {
-        "address": address,
-        "type_name": type_name,
+    return simplify_response(safe_put(port, f"data/{address}", {
+        "type": type_name,
     }, program=program))
 
 
@@ -3792,15 +4739,15 @@ def datatypes_apply(address: str, type_name: str, program: str = None, port: int
 
 @mcp.tool()
 @text_output
-def functions_decompile_async(name: str = None, address: str = None,
-                               timeout: int = 300, program: str = None,
-                               port: int = None) -> dict:
+def functions_decompile_async(name: str | None = None, address: str | None = None,
+                              timeout: int = 300, program: str | None = None,
+                              port: int | None = None) -> dict:
     """Start asynchronous decompilation of a function (for large/complex functions)
 
     Returns a task_id immediately. Use tasks_get_status() and tasks_get_result() to poll.
 
     Args:
-        name: Function name (mutually exclusive with address)
+        name: Function fully-qualified name (mutually exclusive with address)
         address: Function address in hex format (mutually exclusive with name)
         timeout: Decompilation timeout in seconds (default: 300)
         program: Target a specific open program by name (multi-file support)
@@ -3820,7 +4767,7 @@ def functions_decompile_async(name: str = None, address: str = None,
 
 @mcp.tool()
 @text_output
-def tasks_get_status(task_id: str, port: int = None) -> dict:
+def tasks_get_status(task_id: str, port: int | None = None) -> dict:
     """Get the status of an async task
 
     Args:
@@ -3831,12 +4778,12 @@ def tasks_get_status(task_id: str, port: int = None) -> dict:
         dict: Task status (pending/running/completed/failed)
     """
     port = _get_instance_port(port)
-    return simplify_response(safe_get(port, f"tasks/{task_id}"))
+    return simplify_response(safe_get(port, f"tasks/{quote(task_id)}"))
 
 
 @mcp.tool()
 @text_output
-def tasks_get_result(task_id: str, port: int = None) -> dict:
+def tasks_get_result(task_id: str, port: int | None = None) -> dict:
     """Get the result of a completed async task
 
     The task is cleaned up after retrieving the result.
@@ -3849,12 +4796,12 @@ def tasks_get_result(task_id: str, port: int = None) -> dict:
         dict: Task result (e.g. decompiled code)
     """
     port = _get_instance_port(port)
-    return simplify_response(safe_get(port, f"tasks/{task_id}/result"))
+    return simplify_response(safe_get(port, f"tasks/{quote(task_id)}/result"))
 
 
 # ================= Startup =================
 
-def main() -> None:
+def main():
     register_instance(DEFAULT_GHIDRA_PORT,
                       f"http://{ghidra_host}:{DEFAULT_GHIDRA_PORT}")
 
