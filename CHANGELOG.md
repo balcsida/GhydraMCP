@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-09-27
+
 Fork (balcsida/GhydraMCP) changes on top of upstream 3.0.0-rc.1, ported onto the Javalin server.
 
 ### Added
@@ -167,7 +169,8 @@ Fork (balcsida/GhydraMCP) changes on top of upstream 3.0.0-rc.1, ported onto the
 - Initial project setup
 - Basic MCP bridge functionality
 
-[unreleased]: https://github.com/starsong-consulting/GhydraMCP/compare/v3.0.0-rc.1...HEAD
+[unreleased]: https://github.com/balcsida/GhydraMCP/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/balcsida/GhydraMCP/compare/v2.3.0...v3.1.0
 [3.0.0-rc.1]: https://github.com/starsong-consulting/GhydraMCP/compare/v3.0.0-beta...v3.0.0-rc.1
 [2.0.0]: https://github.com/teal-bauer/GhydraMCP/compare/v1.4.0...v2.0.0
 [1.4.0]: https://github.com/teal-bauer/GhydraMCP/compare/v1.3.0...v1.4.0
