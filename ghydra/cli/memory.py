@@ -19,8 +19,9 @@ def memory():
 @click.option('--address', '-a', required=True, help='Memory address (hex)')
 @click.option('--length', type=int, default=16, help='Number of bytes to read')
 @click.option('--format', type=click.Choice(['hex', 'base64', 'string']), default='hex', help='Output format')
+@click.option('--segment', '-s', help='Memory segment/overlay name (e.g. "runtime")')
 @click.pass_context
-def read_memory(ctx, address, length, format):
+def read_memory(ctx, address, length, format, segment):
     """Read bytes from memory.
 
     \b
@@ -28,19 +29,23 @@ def read_memory(ctx, address, length, format):
         ghydra memory read --address 0x401000
         ghydra memory read --address 0x401000 --length 64
         ghydra memory read --address 0x401000 --format string
+        ghydra memory read --address 0x1000 --segment runtime
     """
     client = ctx.obj['client']
     formatter = ctx.obj['formatter']
     config = ctx.obj['config']
 
     try:
+        # GET /memory is the block list; reads go to /memory/{address}.
+        addr = validate_address(address)
+        if segment and ':' not in addr:
+            addr = f'{segment}:{addr}'
         params = {
-            'address': validate_address(address),
             'length': length,
             'format': format
         }
 
-        response = client.get('memory', params=params)
+        response = client.get(f'memory/{addr}', params=params)
         output = formatter.format_memory(response)
 
         if should_page(config, ctx.obj['output_json']):
@@ -115,7 +120,7 @@ def write_memory(ctx, address, bytes_data, format):
             'format': format
         }
 
-        response = client.post(f'memory/{validate_address(address)}', json_data=data)
+        response = client.patch(f'programs/current/memory/{validate_address(address)}', data=data)
         output = formatter.format_simple_result(response)
         click.echo(output)
 

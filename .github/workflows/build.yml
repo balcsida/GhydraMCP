@@ -2,7 +2,7 @@ name: Build Ghidra Plugin
 
 on:
   push:
-    branches: [ main, 'feat/*', 'fix/*' ]
+    branches: [ main, 'api-*', 'feature/*', 'feat/*', 'fix/*', 'bugfix/*' ]
     tags:
       - 'v*'
   pull_request:
@@ -14,71 +14,128 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ghidra-series: [ "11", "12" ]
 
     steps:
-    - uses: actions/checkout@v6
-      with:
-        fetch-depth: 0
+      - uses: actions/checkout@v6
+        with:
+          # Full history so git-commit-id's `describe` can name artifacts after tags.
+          fetch-depth: 0
 
-    - name: Set up JDK 21
-      uses: actions/setup-java@v5
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-        cache: maven
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
 
-    - name: Get latest Ghidra release
-      id: ghidra-release
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        ASSET_NAME=$(gh api repos/NationalSecurityAgency/ghidra/releases/latest --jq '.assets[] | select(.name | endswith(".zip")) | .name' | head -1)
-        DOWNLOAD_URL=$(gh api repos/NationalSecurityAgency/ghidra/releases/latest --jq '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' | head -1)
-        # Extract version from filename like ghidra_12.0.4_PUBLIC_20260303.zip
-        GHIDRA_VERSION=$(echo "$ASSET_NAME" | sed -E 's/ghidra_([0-9.]+)_PUBLIC_.*/\1/')
-        echo "version=$GHIDRA_VERSION" >> "$GITHUB_OUTPUT"
-        echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
-        echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
-        # Use version as cache key
-        echo "Detected latest Ghidra: $GHIDRA_VERSION ($ASSET_NAME)"
+      - name: Resolve latest Ghidra ${{ matrix.ghidra-series }}.x
+        id: ghidra
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERIES: ${{ matrix.ghidra-series }}
+        run: |
+          set -euo pipefail
+          json=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases?per_page=100")
+          # Newest release whose tag is in this major series, then its PUBLIC zip asset.
+          url=$(echo "$json" | jq -r --arg s "$SERIES" '
+            [ .[] | select(.tag_name | test("^Ghidra_" + $s + "\\.")) ]
+            | sort_by(.published_at) | last
+            | .assets[] | select(.name | test("_PUBLIC_[0-9]+\\.zip$")) | .browser_download_url')
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "Could not resolve a Ghidra ${SERIES}.x release"; exit 1
+          fi
+          ver=$(echo "$url" | grep -oP 'ghidra_\K[0-9]+\.[0-9]+(\.[0-9]+)?(?=_PUBLIC)')
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Resolved Ghidra $ver"
+          echo "  $url"
 
-    - name: Cache Ghidra
-      id: cache-ghidra
-      uses: actions/cache@v5
-      with:
-        path: /opt/ghidra
-        key: ghidra-${{ steps.ghidra-release.outputs.version }}
+      - name: Cache Ghidra ${{ steps.ghidra.outputs.version }}
+        id: cache-ghidra
+        uses: actions/cache@v5
+        with:
+          path: ghidra-install
+          key: ghidra-${{ steps.ghidra.outputs.version }}
 
-    - name: Download and install Ghidra
-      if: steps.cache-ghidra.outputs.cache-hit != 'true'
-      run: |
-        wget -q "${{ steps.ghidra-release.outputs.download_url }}" -O /tmp/ghidra.zip
-        unzip -q /tmp/ghidra.zip -d /opt
-        # The extracted folder name varies, find it dynamically
-        GHIDRA_DIR=$(find /opt -maxdepth 1 -name "ghidra_*" -type d | head -1)
-        mv "$GHIDRA_DIR" /opt/ghidra
+      - name: Download Ghidra ${{ steps.ghidra.outputs.version }}
+        if: steps.cache-ghidra.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ghidra.zip "${{ steps.ghidra.outputs.url }}"
+          mkdir -p ghidra-install
+          unzip -q ghidra.zip -d ghidra-install
 
-    - name: Build with Maven
-      env:
-        GHIDRA_HOME: /opt/ghidra
-      run: mvn -B package
+      - name: Set GHIDRA_HOME
+        run: echo "GHIDRA_HOME=$(echo "$PWD"/ghidra-install/ghidra_*_PUBLIC)" >> "$GITHUB_ENV"
 
-    - name: Upload nightly artifacts
-      if: github.ref_type != 'tag'
-      uses: actions/upload-artifact@v7
-      with:
-        name: GhydraMCP-nightly
-        path: |
-          target/GhydraMCP-*.zip
-          bridge_mcp_hydra.py
+      # extension.properties is stamped with the version read from GHIDRA_HOME.
+      - name: Build with Maven
+        run: mvn -B package
 
-    - name: Create Release
-      if: github.ref_type == 'tag'
-      uses: softprops/action-gh-release@v2
-      with:
-        name: GhydraMCP ${{ github.ref_name }}
-        files: |
-          target/GhydraMCP-*.zip
-          bridge_mcp_hydra.py
-        draft: false
-        prerelease: false
+      - name: Tag artifacts with Ghidra version
+        run: |
+          set -euo pipefail
+          for f in target/Ghydra-*.zip; do
+            mv "$f" "${f%.zip}-ghidra${{ steps.ghidra.outputs.version }}.zip"
+          done
+          ls -1 target/Ghydra-*.zip
+
+      - name: Upload nightly artifacts
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ghydra-nightly-ghidra${{ steps.ghidra.outputs.version }}
+          path: |
+            target/Ghydra-*.zip
+            bridge_mcp_hydra.py
+
+      - name: Stage release assets
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-ghidra${{ steps.ghidra.outputs.version }}
+          path: target/Ghydra-*.zip
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Collect built artifacts (all Ghidra versions)
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: release-ghidra*
+          merge-multiple: true
+
+      - name: Generate release notes from CHANGELOG
+        id: notes
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          awk -v version="$VERSION" '
+            BEGIN { print_section=0 }
+            $0 ~ "^## \\[" version "\\]" { print_section=1; next }
+            $0 ~ "^## \\[" && print_section { print_section=0 }
+            print_section
+          ' CHANGELOG.md > release_notes.md
+          echo "file=release_notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: Release ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.file }}
+          files: |
+            dist/*.zip
+            bridge_mcp_hydra.py
+          draft: false
+          # Tags with a pre-release suffix (e.g. v3.0.0-beta) publish as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}

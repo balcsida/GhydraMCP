@@ -1,95 +1,100 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/balcsida/GhydraMCP)](https://github.com/balcsida/GhydraMCP/releases)
-[![API Version](https://img.shields.io/badge/API-v2030-orange)](https://github.com/balcsida/GhydraMCP/blob/main/GHIDRA_HTTP_API.md)
+[![API Version](https://img.shields.io/badge/API-v3000-orange)](https://github.com/balcsida/GhydraMCP/blob/main/GHIDRA_HTTP_API.md)
 
-# GhydraMCP v2.3.0
+# GhydraMCP
 
-GhydraMCP is a powerful bridge between [Ghidra](https://ghidra-sre.org/) and AI assistants that enables comprehensive AI-assisted reverse engineering through the [Model Context Protocol (MCP)](https://github.com/modelcontextprotocol/mcp).
+GhydraMCP is a bridge between [Ghidra](https://ghidra-sre.org/) and AI assistants that enables AI-assisted reverse engineering through the [Model Context Protocol (MCP)](https://github.com/modelcontextprotocol/mcp).
 
 ![GhydraMCP logo](https://github.com/user-attachments/assets/86b9b2de-767c-4ed5-b082-510b8109f00f)
 
 ## Overview
 
-GhydraMCP v2.3.0 integrates four key components:
+GhydraMCP integrates four components:
 
-1. **Modular Ghidra Plugin**: Exposes Ghidra's reverse engineering capabilities through a HATEOAS-driven REST API
-2. **CLI Tool (`ghydra`)**: A standalone command-line interface for direct interaction with Ghidra -- human-readable tables, `--json` mode for AI tool use and scripting
-3. **MCP Bridge**: A Python script that translates MCP requests into API calls for use with Claude Desktop, Claude Code, Cline, etc.
-4. **Multi-instance & Multi-file Architecture**: Connect multiple Ghidra instances and analyze multiple binaries open within the same instance simultaneously
+1. **Ghidra plugin (Ghydra)**: exposes Ghidra's reverse engineering capabilities through a HATEOAS REST API, served by an embedded Javalin server. Builds and runs on Ghidra 11.x and 12.x.
+2. **CLI tool (`ghydra`)**: a standalone command-line client with human-readable tables and a `--json` mode for scripting and AI tool use
+3. **MCP bridge**: a Python script that translates MCP requests into API calls for Claude Desktop, Claude Code, Cline, etc.
+4. **Multi-instance and multi-file architecture**: connect several Ghidra instances, and work on several binaries open in the same instance
 
-This architecture enables AI assistants like Claude to seamlessly:
+This lets AI assistants:
 - Decompile and analyze binary code with customizable output formats
 - Map program structures, function relationships, and complex data types
-- Perform advanced binary analysis (cross-references, call graphs, data flow, byte pattern search)
+- Run cross-reference, call graph, data flow, byte pattern, and scalar (constant) searches
 - Make precise modifications to the analysis (rename, annotate, create/delete/modify data)
 - Batch operations (rename functions, set comments, define data) in single transactions
-- Read/write memory directly and search for byte patterns
+- Read/write memory directly
 - Manage bookmarks, labels, and data types
 - Navigate resources through discoverable HATEOAS links
 - Work with multiple open programs in the same Ghidra instance
 
-GhydraMCP is based on [GhidraMCP by Laurie Wired](https://github.com/LaurieWired/GhidraMCP/), with the modular HATEOAS API architecture, CLI tool, and MCP bridge originally developed by [Starsong Consulting](https://github.com/starsong-consulting/GhydraMCP). This fork adds multi-file support, batch operations, async decompilation, and features from upstream community PRs.
+GhydraMCP is based on [GhidraMCP by Laurie Wired](https://github.com/LaurieWired/GhidraMCP/), with the HATEOAS API, the Javalin plugin, the CLI tool, and the MCP bridge developed by [Starsong Consulting](https://github.com/starsong-consulting/GhydraMCP). This fork tracks upstream and adds multi-file support, batch operations, bookmarks, async decompilation, and a few other features listed below.
 
-## What's New in v2.3.0
+> **Note:** Upstream considers the MCP bridge deprecated in favour of the `ghydra` CLI. This fork still maintains the bridge and adds tools to it.
 
-- **Multi-file support**: Open, close, and switch between multiple programs in the same Ghidra instance. Pass `?program=name` to any endpoint to target a specific open program.
-- **Batch operations**: Rename multiple functions, set comments at many addresses, and define data items in bulk -- all in single atomic transactions.
-- **Byte pattern search**: Search all program memory for byte patterns (`GET /memory/search?bytes=4D5A`).
-- **Bookmark management**: Add, list, and delete Ghidra bookmarks via API.
-- **Async decompilation**: Start long-running decompilations in the background and poll for results.
-- **Data enhancements**: Clear/undefine data, create labels at arbitrary addresses, get detailed data info at specific addresses, apply structs at memory locations.
-- **Inline data type creation**: Create structs with fields, enums with values, and unions with members in a single call.
-- **Decompiler constant inlining**: Constant values from read-only memory are now shown inline in decompiled output.
-- **Security**: HTTP server now binds to 127.0.0.1 only (not all network interfaces).
-- **Removed bundled JARs**: Set `GHIDRA_HOME` environment variable instead. Reduces repo size by ~33MB.
+## Fork Additions
+
+On top of upstream 3.0.0-rc.1:
+
+- **Multi-file support**: open, close, and switch between programs in the same Ghidra instance. Add `?program=<name>` to any endpoint to target a specific open program.
+- **Batch operations**: rename many functions, set many comments, or define many data items in one atomic transaction, with a per-item status.
+- **Bookmark management**: add, list, and delete Ghidra bookmarks.
+- **Async decompilation**: start long-running decompilations in the background and poll for the result.
+- **Data helpers**: clear a byte range, create labels at arbitrary addresses, inspect data at an address, apply data types (e.g. stamp a struct), and search memory for byte patterns from the bridge.
+- **Decompiler constant inlining**: the decompiler is pinned to respect read-only memory (Ghidra's default), so constants from read-only blocks are shown inline.
+- **Loopback by default**: the HTTP server binds to 127.0.0.1 only; see [Network access](#network-access) to expose it.
+- **No bundled JARs**: builds read the Ghidra JARs and version from `GHIDRA_HOME`.
+
+See [CHANGELOG.md](CHANGELOG.md) for details, including upstream's 3.0 changes (Javalin server, fully-qualified names, scalar search, scripts, program save).
 
 # Features
 
-## Advanced Program Analysis
+## Program Analysis
 
-- **Enhanced Decompilation**: Convert binary functions to readable C code with configurable styles, syntax trees, constant inlining, and line filtering
-- **Async Decompilation**: Start decompilation in the background and poll for results (for large/complex functions)
-- **Comprehensive Static Analysis**: Cross-reference analysis, call graph generation, data flow analysis, type propagation
-- **Memory Operations**: Direct memory reading/writing with hex and base64 representation, byte pattern search across all memory blocks
-- **Symbol Management**: View and analyze imports, exports, symbols, namespace hierarchy
+- **Decompilation**: convert functions to readable C with configurable styles, syntax trees, constant inlining, and line filtering; long-running decompiles can run asynchronously
+- **Static analysis**: cross-references, call graphs, data flow, type propagation
+- **Search**: byte patterns across memory, scalar (constant) values in instructions, functions/symbols/data by name, regex, or address
+- **Memory operations**: read/write memory as hex or base64
+- **Symbols**: imports, exports, symbols, namespace hierarchy
 
 ## Interactive Reverse Engineering
 
-- **Code Understanding**: Explore function code, data structures, disassembly with linking to decompiled code
-- **Comprehensive Annotation**: Rename functions/variables/data, add comments (EOL, plate, pre/post), create/modify data types, set function signatures
-- **Bookmark Management**: Add, list, and delete bookmarks for tracking analysis progress
+- **Annotation**: rename functions/variables/data, add comments (EOL, plate, pre/post), set function signatures
+- **Fully-qualified names**: names such as `FOM::SharedMemory::ReadUInt` are used for lookup and output; renaming to `A::B::name` moves the symbol into that namespace (see [GHIDRA_HTTP_API.md](GHIDRA_HTTP_API.md))
+- **Bookmarks**: add, list, and delete bookmarks to track analysis progress
+- **Scripts**: run Ghidra scripts through the API (disabled unless the server is started with `-Dghydra.dev.allowScripts=true` or `GHYDRA_ALLOW_SCRIPTS=1`)
 
 ## Data Manipulation
 
-- **Data Items**: Create, delete, rename, retype data items, clear/undefine bytes, create labels at arbitrary addresses
-- **Batch Operations**: Rename multiple functions, set comments at many addresses, define data items in bulk -- all in single transactions
-- **Struct/Enum/Union Creation**: Create complex data types with inline field/value definitions in a single call
-- **Apply Data Types**: Stamp structs and other data types at memory addresses
+- **Data items**: create, delete, rename, retype, clear/undefine bytes, create labels at arbitrary addresses
+- **Batch operations**: rename functions, set comments, and define data in bulk
+- **Struct/enum/union creation**: create data types with inline fields or values in a single call
+- **Apply data types**: stamp structs and other types at memory addresses
 
-## Multi-instance & Multi-file Support
+## Multiple Instances and Programs
 
-- **Multi-instance**: Run multiple Ghidra instances simultaneously on ports 8192-8447 (256 port range) with auto-discovery
-- **Multi-file**: Open, close, and switch between multiple programs within the same Ghidra instance
-- **Program Targeting**: Pass `?program=name` to any endpoint (or `program=name` to any MCP tool) to operate on a specific open program without switching
-- **Project Management**: List project files, open files in CodeBrowser, navigate folder hierarchy
+- **Multi-instance**: run several Ghidra instances on ports 8192-8447 (256-port range) with auto-discovery
+- **Multi-file**: open, close, and switch between programs in the same Ghidra instance
+- **Program targeting**: add `?program=name` to any endpoint to operate on a specific open program without switching
+- **Projects**: list project files, open files in CodeBrowser, navigate the folder hierarchy, save programs
 
 # Installation
 
 ## Prerequisites
-- [Ghidra](https://ghidra-sre.org) (11.4.2+ recommended)
-- Python 3.11+ (for MCP bridge or CLI)
-- `GHIDRA_HOME` environment variable set to your Ghidra installation directory (for building from source)
+- [Ghidra](https://ghidra-sre.org) 11.x or 12.x
+- Python 3.11+ (for the MCP bridge or CLI)
+- `GHIDRA_HOME` pointing at your Ghidra installation (only for building from source)
 
 ## Ghidra Plugin
 
-Download the latest [release](https://github.com/balcsida/GhydraMCP/releases) from this repository. Then install the plugin:
+Download the latest [release](https://github.com/balcsida/GhydraMCP/releases) from this repository, then install the plugin:
 
 1. Run Ghidra
 2. Select `File` -> `Install Extensions`
 3. Click the `+` button
-4. Select the `GhydraMCP-[version].zip` file from the downloaded release
+4. Select the `Ghydra-*-ghidra<version>.zip` that matches your Ghidra version (e.g. `...-ghidra12.1.2.zip` for Ghidra 12.1.2)
 5. Restart Ghidra
-6. Make sure the GhydraMCPPlugin is enabled in `File` -> `Configure` -> `Developer`
+6. Make sure the Ghydra plugin is enabled in `File` -> `Configure` -> `Developer`
 
 > **Note:** By default, the first CodeBrowser opened gets port 8192, the second gets 8193, and so on. Check the Ghidra Console (computer icon in bottom right) for log entries like:
 > ```
@@ -97,15 +102,19 @@ Download the latest [release](https://github.com/balcsida/GhydraMCP/releases) fr
 > [GhydraMCP] HTTP server started on port 8192
 > ```
 >
-> GhydraMCP includes auto-discovery of running instances, so manually registering each instance is typically not necessary.
+> The bridge and CLI auto-discover running instances, so registering each one by hand is usually unnecessary.
 
-Video Installation Guide:
+Video installation guide:
 
 https://github.com/user-attachments/assets/75f0c176-6da1-48dc-ad96-c182eb4648c3
 
+### Network access
+
+The plugin's API has no authentication, so it listens on `127.0.0.1` only. To reach it from another host (for example the bridge running in WSL with Ghidra on Windows), start Ghidra with `-Dghidra.mcp.bind.host=0.0.0.0` or set `GHYDRA_BIND_HOST=0.0.0.0`, and restrict access with a firewall.
+
 ## CLI Tool
 
-GhydraMCP includes `ghydra`, a command-line tool for interacting with Ghidra directly from the terminal. It works standalone -- no MCP client needed.
+GhydraMCP includes `ghydra`, a command-line tool for talking to Ghidra from the terminal. It works standalone, no MCP client needed.
 
 ```bash
 # Install
@@ -117,14 +126,14 @@ ghydra instances list
 # List open programs in an instance
 ghydra programs list-open
 
-# Open another binary in the same instance
-ghydra programs open /path/to/binary
+# Open another binary from the project in the same instance
+ghydra programs open /path/in/project/binary
 
 # Decompile a function
 ghydra functions decompile --name main
 
-# Decompile from a specific open program
-ghydra functions decompile --name main --program malware.exe
+# Search for a constant
+ghydra scalars search 0xdeadbeef
 
 # List strings matching a pattern
 ghydra data list-strings --filter "password"
@@ -139,9 +148,9 @@ All commands support `--host`, `--port`, `--json`, and `--no-color` flags. See [
 
 GhydraMCP works with any MCP-compatible client using **stdio transport**. Tested with:
 
-- **Claude Desktop** - Anthropic's official desktop application
+- **Claude Desktop** - Anthropic's desktop application
 - **Claude Code** - Anthropic's CLI tool and VS Code extension
-- **Cline** - Popular VS Code extension for AI-assisted coding
+- **Cline** - VS Code extension for AI-assisted coding
 
 ### Configuration
 
@@ -166,7 +175,9 @@ Add to your MCP client's configuration:
 
 Replace `/ABSOLUTE_PATH_TO/` with the actual path to your `bridge_mcp_hydra.py` file.
 
-> **Note:** You can also use `python` instead of `uv run`, but then install requirements first: `pip install mcp requests`.
+> **Note:** You can also use `python` instead of `uv run`, but then install the requirements first: `pip install mcp requests pydantic`.
+
+The bridge's HTTP timeout defaults to 900s (`GHIDRA_TIMEOUT`) and its decompilation timeout to 1200s (`GHIDRA_DECOMP_TIMEOUT`).
 
 **Configuration file locations:**
 - **Claude Desktop (macOS)**: `~/Library/Application Support/Claude/claude_desktop_config.json`
@@ -175,36 +186,41 @@ Replace `/ABSOLUTE_PATH_TO/` with the actual path to your `bridge_mcp_hydra.py` 
 
 ## Available MCP Tools
 
-GhydraMCP v2.3.0 organizes tools into logical namespaces:
+Tools are organized into namespaces:
 
-| Namespace | Tools | New in v2.3.0 |
+| Namespace | Tools | Fork additions |
 |---|---|---|
 | `instances_*` | `list`, `discover`, `register`, `unregister`, `use`, `current` | |
-| `programs_*` | `list_open`, `open`, `close`, `switch` | All new |
-| `functions_*` | `list`, `get`, `decompile`, `disassemble`, `create`, `rename`, `set_signature`, `get_variables`, `set_comment`, `decompile_async` | `decompile_async` |
-| `tasks_*` | `get_status`, `get_result` | All new |
+| `programs_*` | `list`, `get`, `delete`, `save`, `list_open`, `open`, `close`, `switch` | `list_open`, `open`, `close`, `switch` |
+| `projects_*` / `project_*` | `projects_list`, `projects_get`, `project_info`, `project_list_files`, `project_open_file` | |
+| `functions_*` | `list`, `get`, `get_containing`, `get_next`, `get_prev`, `decompile`, `decompile_async`, `disassemble`, `create`, `delete`, `rename`, `set_signature`, `get_variables`, `update_variable`, `set_comment` | `decompile_async` |
+| `tasks_*` | `get_status`, `get_result` | all |
 | `data_*` | `list`, `list_strings`, `create`, `rename`, `delete`, `set_type`, `clear`, `create_label`, `at_address` | `clear`, `create_label`, `at_address` |
-| `batch_*` | `rename_functions`, `set_comments`, `define_data` | All new |
-| `memory_*` | `read`, `write`, `search_bytes` | `search_bytes` |
-| `bookmarks_*` | `list`, `add`, `delete` | All new |
-| `datatypes_*` | `list`, `search`, `apply` | `apply` |
+| `batch_*` | `rename_functions`, `set_comments`, `define_data` | all |
+| `memory_*` | `read`, `write`, `disassemble`, `search_bytes` | `search_bytes` |
+| `scalars_*` | `search` | |
+| `bookmarks_*` | `list`, `add`, `delete` | all |
+| `datatypes_*` | `list`, `search`, `create_struct`, `create_enum`, `create_union`, `apply` | `apply` |
 | `structs_*` | `list`, `get`, `create`, `add_field`, `update_field`, `delete` | |
 | `xrefs_*` | `list` | |
 | `analysis_*` | `run`, `status`, `get_callgraph`, `get_dataflow` | |
 | `symbols_*` | `list`, `imports`, `exports` | |
-| Other | `classes_*`, `segments_*`, `namespaces_*`, `variables_*`, `project_*`, `comments_*`, `ui_*` | |
+| `scripts_*` | `list`, `run` | |
+| Other | `classes_*`, `segments_*`, `namespaces_*`, `variables_*`, `comments_*`, `ui_*` | |
 
-> **Multi-file tip**: Most tools accept a `program` parameter to target a specific open program by name (e.g. `functions_list(program="malware.exe")`). Without it, the active/current program is used.
+> **Multi-file tip**: the tools with a `program` parameter (`functions_list`, `functions_get`, `functions_decompile`, `functions_decompile_async`, `scalars_search`, and the `bookmarks_*`, `batch_*`, `memory_search_bytes` and `data_*` helpers added by this fork) can target a specific open program by name, e.g. `functions_list(program="malware.exe")`. Other tools use the current program; switch it with `programs_switch`.
 
 # Building from Source
 
 ## Prerequisites
 
-Set the `GHIDRA_HOME` environment variable to your Ghidra installation:
+Set the `GHIDRA_HOME` environment variable to your Ghidra installation (11.x or 12.x):
 
 ```bash
-export GHIDRA_HOME=/path/to/ghidra_11.4.2_PUBLIC
+export GHIDRA_HOME=/path/to/ghidra_12.1.2_PUBLIC
 ```
+
+The build compiles against the JARs in `GHIDRA_HOME` and stamps the extension with the version from `$GHIDRA_HOME/Ghidra/application.properties`, so install the result into that same Ghidra version.
 
 ## Build
 
@@ -217,8 +233,8 @@ mvn clean package -P plugin-only
 ```
 
 This creates:
-- `target/GhydraMCP-[version].zip` - The Ghidra plugin
-- `target/GhydraMCP-Complete-[version].zip` - Complete package with plugin and bridge script
+- `target/Ghydra-[version].zip` - the Ghidra plugin
+- `target/Ghydra-Complete-[version].zip` - complete package with the plugin and bridge script
 
 # Testing
 
@@ -230,6 +246,6 @@ Apache License 2.0 - see [LICENSE](LICENSE) for details.
 
 # Credits
 
-- [GhidraMCP by Laurie Wired](https://github.com/LaurieWired/GhidraMCP/) — the original Ghidra MCP plugin
-- [Starsong Consulting](https://github.com/starsong-consulting/GhydraMCP) — modular HATEOAS API architecture, CLI tool (`ghydra`), MCP bridge rewrite, multi-instance support, struct/data type management, and the overall GhydraMCP platform
-- Community contributors to the upstream GhidraMCP PRs that inspired features in this release
+- [GhidraMCP by Laurie Wired](https://github.com/LaurieWired/GhidraMCP/): the original Ghidra MCP plugin
+- [Starsong Consulting](https://github.com/starsong-consulting/GhydraMCP): the HATEOAS API, the Javalin plugin, the CLI tool (`ghydra`), the MCP bridge, multi-instance support, struct/data type management, and the overall GhydraMCP platform
+- Community contributors to the upstream GhydraMCP PRs that inspired features in this fork

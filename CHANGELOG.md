@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Fork (balcsida/GhydraMCP) changes on top of upstream 3.0.0-rc.1, ported onto the Javalin server.
+
+### Added
+- **Multi-file support:** every program-scoped endpoint accepts `?program=<name>` (program name or project pathname) to target one of the programs open in the tool; an unknown name is `404 PROGRAM_NOT_FOUND`. New `GET /programs/open-programs`, `POST /programs/open`, `POST /programs/switch`, `POST /programs/close`; bridge tools `programs_list_open`/`programs_open`/`programs_switch`/`programs_close` and a `program` parameter on `functions_list`, `functions_get`, `functions_decompile`, `scalars_search` and the tools below; CLI `ghydra programs list-open|open|switch|close`.
+- **Bookmarks:** `GET /bookmarks`, `POST /bookmarks`, `DELETE /bookmarks/{address}?type=`; bridge `bookmarks_list`/`bookmarks_add`/`bookmarks_delete`.
+- **Batch operations:** `POST /batch/rename-functions`, `/batch/set-comments`, `/batch/define-data` apply many edits in one transaction with a per-item status; bridge `batch_*` tools.
+- **Async decompilation:** `POST /functions/decompile-async` returns a task id; poll `GET /tasks/{id}` and fetch `GET /tasks/{id}/result`; bridge `functions_decompile_async`, `tasks_get_status`, `tasks_get_result`.
+- **Bridge data helpers:** `memory_search_bytes` (over `GET /memory/search`), `data_clear` (with an optional byte `size`, via `DELETE /data/{address}?size=N`), `data_create_label`, `data_at_address`, `datatypes_apply`.
+- **Decompiler constant inlining:** the decompiler is pinned to respect read-only memory (Ghidra's default), so constants from read-only blocks are shown inline.
+
+### Changed
+- **Loopback by default:** the HTTP server binds to `127.0.0.1`. Set `-Dghidra.mcp.bind.host=0.0.0.0` (or `GHYDRA_BIND_HOST`) for cross-host setups such as a bridge in WSL.
+- **Build requires `GHIDRA_HOME`:** the bundled Ghidra JARs are removed, and the extension's `version`/`ghidraVersion` are read from `$GHIDRA_HOME/Ghidra/application.properties`, so every build matches the Ghidra it was compiled against.
+- **Bridge discovery:** instance discovery and health checks run in parallel; default-host scans are cached for 5 seconds.
+- **`POST /programs/close`** refuses a program with unsaved changes unless `discard` is true.
+
+### Fixed
+- **MCP prompts:** `analyze_function`, `identify_vulnerabilities` and `reverse_engineer_binary` return text built from Pydantic context models; FastMCP could not render the previous dict results.
+
+## [3.0.0-rc.1] - 2026-06-18
+
+### Changed
+- **Breaking: fully-qualified symbol names.** Functions, symbols, data labels, variables, and xrefs now use the fully-qualified name (namespace path, e.g. `FOM::SharedMemory::ReadUInt`; global-namespace members are unprefixed) for lookup, filtering, and output. `GET /functions/by-name/{fqn}` takes a URL-encoded FQN; a bare name resolves in the global namespace only. Renaming a function, data label, or symbol to an `A::B::name` value moves it into that namespace (created if absent); a leading `::` or `Global::` moves it to the global namespace. The separate `namespace` field is removed from function and symbol responses (folded into the FQN `name`). Local variable names stay bare and reject `::`. `API_VERSION` bumped to 3000. Reimplemented from PR #18 against the Javalin layer. (#18)
+
+### Added
+- **`analysis` link on `/program`:** the program resource now advertises an `analysis` link (to `/analysis/status`) for HATEOAS discoverability.
+- **Run Ghidra scripts via the API:** `GET /scripts` (list) and `POST /scripts/run` (run an existing script by `name`, or compile and run ad-hoc GhidraScript `source`, with `args`), plus `scripts_list`/`scripts_run` bridge tools and `ghydra scripts list`/`run`. Captures the script's output. Lets an agent do multi-stage/batch work (mass rename, signature transfer) in one call. Arbitrary code execution, so it is disabled unless the server is started with `-Dghydra.dev.allowScripts=true` (or `GHYDRA_ALLOW_SCRIPTS=1`). (#3)
+- **Scalar search:** find constant values in instructions (`GET /scalars`, `scalars_search` bridge tool, `ghydra scalars search`), like Ghidra's "Search For Scalars". Filter by containing function (`in_function`) or by a nearby called function (`to_function`, e.g. the `0` passed to `memset`). The `in_function` filter scans only the matching functions; unfiltered scans on large programs are time-bounded and report `scanTruncated`. Reimplemented from PR #17 against the Javalin layer. (#17)
+- **Save endpoint:** `POST /program/save` persists the current program to the project (`?all=true` saves every open program with unsaved changes).
+- **Dev-only shutdown endpoint:** `POST /dev/shutdown` quits Ghidra so the build/deploy/restart loop can be automated. Off by default; enable with `-Dghydra.dev.allowShutdown=true` or `GHYDRA_DEV_SHUTDOWN=1`. With unsaved changes it refuses (409) unless `?save=true` (save, then exit) or `?force=true` (discard, then exit).
+
+### Fixed
+- **HATEOAS links:** templated links with a single string argument (an address or name) emitted a literal `{}` href with the value misplaced into a `method` field; they now substitute correctly across all endpoints. Action links use a new `linkWithMethod`.
+- **Disassembly truncation:** the bridge text output now reports the total instruction count and the next offset when a function's disassembly is paginated, instead of silently showing the first 100. `functions_disassemble` no longer documents `limit=0` as "all".
+- **Agent-clean CLI output:** color is auto-disabled when stdout is not a terminal (and honors `NO_COLOR`), so piped or captured `ghydra` output no longer carries ANSI codes that corrupted hex-address parsing.
+
+## [3.0.0-beta] - 2026-06-16
+
+### Changed
+- **Ghidra 11.x + 12.x:** The plugin builds and runs against both Ghidra 11.x and 12.x; CI builds a matrix over the latest of each. Per-version extension artifacts are stamped with the matching `ghidraVersion` (which must equal the running Ghidra exactly).
+- **Ghidra 12.x:** Migrated the plugin to build against Ghidra 12.x (tested on 12.1.2). Build with `GHIDRA_HOME` pointing at the install, or `-Dghidra.version=` to stamp the extension.
+- **Javalin HTTP server:** The plugin now embeds a Javalin/Jetty server with a layered `resource`/`service`/`dto`/`hateoas`/`middleware`/`server` structure, replacing the previous JDK `HttpServer` + `endpoints/` implementation. Shaded into a single `Ghydra.jar`.
+
+### Fixed
+- **Locked buffer crashes:** DB-iterator traversals are marshalled onto the EDT (`GhidraSwing.runRead`), fixing `IOException: Locked buffer` crashes during concurrent analysis.
+- **StackOverflow containment:** A self-referential pointer made Ghidra's own label resolution recurse without bound; reads now contain the resulting `Error` and fail the request cleanly instead of crashing the EDT.
+- **Call graph callees:** Callee discovery scans the whole function body instead of just the entry address, so `/analysis/callgraph` and `/analysis/callees` return results.
+- **Client errors return 400:** Malformed input (bad addresses, hex, JSON bodies, invalid params) maps to HTTP 400 instead of 500; `/xrefs` pagination no longer returns empty pages past the first.
+- **Bridge/CLI field sync:** Bridge and CLI formatters match the server's response field names (decompilation, variables, xrefs, segments, memory), and integral JSON numbers are no longer rendered as floats.
+
 ## [2.0.0] - 2025-11-11
 
 ### Added
@@ -117,7 +167,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Initial project setup
 - Basic MCP bridge functionality
 
-[unreleased]: https://github.com/teal-bauer/GhydraMCP/compare/v2.0.0...HEAD
+[unreleased]: https://github.com/starsong-consulting/GhydraMCP/compare/v3.0.0-rc.1...HEAD
+[3.0.0-rc.1]: https://github.com/starsong-consulting/GhydraMCP/compare/v3.0.0-beta...v3.0.0-rc.1
 [2.0.0]: https://github.com/teal-bauer/GhydraMCP/compare/v1.4.0...v2.0.0
 [1.4.0]: https://github.com/teal-bauer/GhydraMCP/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/teal-bauer/GhydraMCP/compare/v1.2...v1.3.0

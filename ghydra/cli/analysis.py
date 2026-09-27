@@ -18,29 +18,37 @@ def analysis():
 
 @analysis.command('run')
 @click.option('--analysis-options', help='Analysis options as JSON dict')
+@click.option('--background/--foreground', default=True,
+              help='Run analysis in background (default) or block until complete')
 @click.pass_context
-def run_analysis(ctx, analysis_options):
+def run_analysis(ctx, analysis_options, background):
     """Run analysis on the current program.
 
     \b
     Examples:
         ghydra analysis run
+        ghydra analysis run --foreground
         ghydra analysis run --analysis-options '{"functionRecovery": true}'
     """
     client = ctx.obj['client']
     formatter = ctx.obj['formatter']
 
     try:
-        data = {}
+        payload = {}
 
         if analysis_options:
             try:
-                data['options'] = json.loads(analysis_options)
+                opts = json.loads(analysis_options)
+                if not isinstance(opts, dict):
+                    raise click.BadParameter('--analysis-options must be a JSON object')
+                payload.update(opts)
             except json.JSONDecodeError as e:
                 click.echo(f"Error: Invalid JSON in --analysis-options: {e}", err=True)
                 ctx.exit(1)
 
-        response = client.post('analysis', json_data=data if data else None)
+        payload.setdefault('background', str(background).lower())
+
+        response = client.post('analysis/run', json_data=payload)
         output = formatter.format_simple_result(response)
         click.echo(output)
 
@@ -58,33 +66,38 @@ def run_analysis(ctx, analysis_options):
 def get_callgraph(ctx, name, address, max_depth):
     """Get function call graph visualization data.
 
-    If neither --name nor --address is provided, uses entry point.
+    One of --name or --address is required.
 
     \b
     Examples:
         ghydra analysis get-callgraph --name main
         ghydra analysis get-callgraph --address 0x401000 --max-depth 5
-        ghydra analysis get-callgraph  # Uses entry point
     """
     client = ctx.obj['client']
     formatter = ctx.obj['formatter']
     config = ctx.obj['config']
 
+    if not address and not name:
+        rich_echo("Error: one of --name or --address is required", err=True)
+        ctx.exit(1)
+
     try:
+        # Server reads "depth"; send both for older builds.
         params = {
+            'depth': max_depth,
             'max_depth': max_depth
         }
 
-        if name:
-            from urllib.parse import quote
-            endpoint = f'analysis/callgraph/by-name/{quote(name)}'
-        elif address:
-            endpoint = f'analysis/callgraph/{validate_address(address)}'
-        else:
-            endpoint = 'analysis/callgraph'
+        if address:
+            params['address'] = validate_address(address)
+        elif name:
+            params['name'] = name
 
-        response = client.get(endpoint, params=params)
-        output = formatter.format_simple_result(response)
+        response = client.get('analysis/callgraph', params=params)
+        if hasattr(formatter, "format_callgraph"):
+            output = formatter.format_callgraph(response)
+        else:
+            output = formatter.format_simple_result(response)
 
         if should_page(config, ctx.obj['output_json']):
             page_output(output, use_pager=config.page_output)
@@ -115,13 +128,18 @@ def get_dataflow(ctx, address, direction, max_steps):
     config = ctx.obj['config']
 
     try:
+        # The server takes the address as a query param, not a path segment.
         params = {
+            'address': validate_address(address),
             'direction': direction,
             'max_steps': max_steps
         }
 
-        response = client.get(f'analysis/dataflow/{validate_address(address)}', params=params)
-        output = formatter.format_simple_result(response)
+        response = client.get('analysis/dataflow', params=params)
+        if hasattr(formatter, "format_dataflow"):
+            output = formatter.format_dataflow(response)
+        else:
+            output = formatter.format_simple_result(response)
 
         if should_page(config, ctx.obj['output_json']):
             page_output(output, use_pager=config.page_output)

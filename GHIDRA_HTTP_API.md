@@ -94,19 +94,26 @@ Common HTTP Status Codes:
 
 Resources like functions, data, and symbols often exist at specific memory addresses and may have names.
 
+Names are **fully-qualified** (FQN): the namespace path joined with `::` (e.g. `MyClass::myMethod`, `FOM::SharedMemory::ReadUInt`); members of the global namespace are unprefixed (e.g. `main`). **Breaking:** all name filters below match against the fully-qualified name, and a bare name (no `::`) resolves in the global namespace only (it no longer matches a symbol that lives in some namespace).
+
 - **By Address:** Use the resource's path with the address (hexadecimal, e.g., `0x401000` or `08000004`).
   - Example: `GET /functions/0x401000`
 - **Querying Lists:** List endpoints (e.g., `/functions`, `/symbols`, `/data`) support filtering via query parameters:
   - `?addr=[address in hex]`: Find item at a specific address.
-  - `?name=[full_name]`: Find item(s) with an exact name match (case-sensitive).
-  - `?name_contains=[substring]`: Find item(s) whose name contains the substring (case-insensitive).
-  - `?name_matches_regex=[regex]`: Find item(s) whose name matches the Java-compatible regular expression.
+  - `?name=[fqn]`: Find item(s) whose fully-qualified name matches exactly (case-sensitive). (`/data` uses `?label=` / `?label_contains=`.)
+  - `?name_contains=[substring]`: Find item(s) whose fully-qualified name contains the substring (case-insensitive).
+  - `?name_matches_regex=[regex]`: Find item(s) whose fully-qualified name matches the Java-compatible regular expression.
 
 ### Pagination
 
 List endpoints support pagination using query parameters:
 - `?offset=[int]`: Number of items to skip (default: 0).
 - `?limit=[int]`: Maximum number of items to return (default: implementation-defined, e.g., 100).
+
+### Targeting an Open Program
+
+A CodeBrowser can have several programs open at once (see [Open Programs](#12-open-programs-multi-file)). Every program-scoped endpoint accepts `?program=[name]` to operate on one of them instead of the current program; the value matches the program name or its project pathname (e.g. `malware.exe` or `/samples/malware.exe`). An unknown name returns `404 PROGRAM_NOT_FOUND`, never a silent fallback to the current program.
+- Example: `GET /functions?program=helper.dll&name_contains=init`
 
 ## Meta Endpoints
 
@@ -240,6 +247,8 @@ Represents the current binary loaded in Ghidra.
   }
   ```
 
+- **`POST /program/save`**: Persist the current program to the project (Ghidra's "Save"). Add `?all=true` to save every open program that has unsaved changes. A program with no changes returns `{ "saved": false, "detail": "no unsaved changes" }`.
+
 ### 3. Current Location
 
 Provides information about the current cursor position and function in Ghidra's CodeBrowser.
@@ -282,17 +291,18 @@ Provides information about the current cursor position and function in Ghidra's 
 
 ### 4. Functions
 
-Represents functions within the current program.
+Represents functions within the current program. Function names are **fully-qualified** (FQN), including the namespace path (e.g. `FOM::SharedMemory::ReadUInt`); functions in the global namespace are unprefixed (e.g. `main`).
 
-- **`GET /functions`**: List functions. Supports searching (by name/address/regex) and pagination.
+- **`GET /functions`**: List functions. Supports searching (by name/address/regex, all against the FQN) and pagination.
   ```json
   // Example Response Fragment
   "result": [
     { "name": "FUN_08000004", "address": "08000004", "_links": { "self": { "href": "/functions/08000004" } } },
-    { "name": "init_peripherals", "address": "08001cf0", "_links": { "self": { "href": "/functions/08001cf0" } } }
+    { "name": "FOM::SharedMemory::ReadUInt", "address": "08001cf0", "_links": { "self": { "href": "/functions/08001cf0" } } }
   ]
   ```
 - **`POST /functions`**: Create a function at a specific address. Requires `address` in the request body. Returns the created function resource.
+- **`GET /functions/by-name/{fqn}`**: Get a function by its fully-qualified name. The FQN must be URL-encoded (e.g. `FOM::ReadUInt` -> `FOM%3A%3AReadUInt`); a bare name resolves in the global namespace only. `PATCH` and `DELETE` (and the `decompile`/`disassembly`/`variables` sub-resources) are also served under this path.
 - **`GET /functions/{address}`**: Get details for a specific function (name, signature, size, stack info, etc.).
   ```json
   // Example Response Fragment for GET /functions/0x4010a0
@@ -315,13 +325,13 @@ Represents functions within the current program.
     "xrefs_from": { "href": "/xrefs?from_addr=0x4010a0" }
   }
   ```
-- **`PATCH /functions/{address}`**: Modify a function. Addressable only by address. Payload can contain:
-  - `name`: New function name.
+- **`PATCH /functions/{address}`**: Modify a function. Payload can contain:
+  - `name`: New fully-qualified name. `A::B::foo` moves the function into namespace `A::B` (created if absent); a leading `::` (or `Global::`) moves it to the global namespace; a bare name keeps the current namespace.
   - `signature`: Full function signature string (e.g., `void my_func(int p1, char * p2)`).
   - `comment`: Set/update the function's primary comment.
   ```json
-  // Example PATCH payload
-  { "name": "calculate_checksum", "signature": "uint32_t calculate_checksum(uint8_t* buffer, size_t length)" }
+  // Example PATCH payload (rename and move into the Crypto namespace)
+  { "name": "Crypto::calculate_checksum", "signature": "uint32_t calculate_checksum(uint8_t* buffer, size_t length)" }
   ```
 - **`DELETE /functions/{address}`**: Delete the function definition at the specified address.
 
@@ -365,11 +375,17 @@ Represents named locations (functions, data, labels).
 
 Represents defined data items in memory.
 
-- **`GET /data`**: List defined data items. Supports searching (by name/address/regex) and pagination. Can filter by type (`?type=string`, `?type=dword`, etc.).
+- **`GET /data`**: List data items, with pagination and filters:
+  - `?label=[string]`: exact label (name) match.
+  - `?label_contains=[string]`: label substring match (case-insensitive).
+  - `?type=[string]`: filter by data type (`string`, `dword`, etc.).
+  - `?addr=[hex]`: look up a single address; returns defined data first, falling back to a label symbol when no defined data exists there.
+  - (The `data_list` bridge tool and `ghydra data list` expose `label`/`label_contains` as `name`/`name_contains`.)
 - **`POST /data`**: Define a new data item. Requires `address`, `type`, and optionally `size` or `length` in the payload.
 - **`GET /data/{address}`**: Get details of the data item at the specified address (type, size, value representation).
 - **`PATCH /data/{address}`**: Modify a data item (e.g., change `name`, `type`, `comment`). Payload specifies changes.
 - **`DELETE /data/{address}`**: Undefine the data item at the specified address.
+  - `?size=[int]` (optional): clear every code unit overlapping `size` bytes starting at the address instead of just the item at the address.
 
 ### 6.1 Strings
 
@@ -599,6 +615,42 @@ Provides functionality for creating and managing struct (composite) data types.
   }
   ```
 
+### 6.3 Scalars
+
+Search for scalar (constant) values in instructions, like Ghidra's "Search For Scalars".
+
+- **`GET /scalars`**: Find occurrences of a specific scalar value in instruction operands.
+  - Query Parameters:
+    - `?value=[int]`: **Required.** Value to search for (hex `0x...` / `-0x...`, or decimal).
+    - `?in_function=[string]`: Only matches inside functions whose name contains this substring (case-insensitive). On a large program this is much faster: it scans only the matching functions instead of every instruction.
+    - `?to_function=[string]`: Only matches where the instruction feeds a nearby call (within ~10 instructions) to a function whose name contains this substring. Useful for finding a specific argument passed to a function.
+    - `?offset=[int]`: Pagination offset (default: 0).
+    - `?limit=[int]`: Maximum results to return (default: 100).
+  - `meta.scanTruncated` is `true` when an unfiltered or `to_function` scan hit its time budget before finishing (large programs). Results are then partial; narrow with `in_function` or a more specific value for completeness.
+  ```json
+  // Example Response for GET /scalars?value=0&to_function=memset
+  "result": [
+    {
+      "address": "00401234",
+      "value": 0,
+      "hexValue": "0x0",
+      "bitLength": 32,
+      "signed": false,
+      "operandIndex": 1,
+      "instruction": "PUSH 0x0",
+      "inFunction": "main",
+      "inFunctionAddress": "00401200",
+      "toFunction": "memset",
+      "toFunctionAddress": "00402000"
+    }
+  ],
+  "meta": { "offset": 0, "limit": 100, "returned": 1, "scanTruncated": false },
+  "_links": {
+    "self": { "href": "/scalars?value=0&to_function=memset&offset=0&limit=100" },
+    "program": { "href": "/program" }
+  }
+  ```
+
 ### 7. Memory Segments
 
 Represents memory blocks/sections defined in the program. 
@@ -729,6 +781,72 @@ Provides access to Ghidra's analysis results.
     ]
   }
   ```
+
+### 11. Scripts (gated)
+
+Run Ghidra scripts via the API, for multi-stage or batch operations (mass rename, signature transfer, etc.).
+
+**Disabled by default** because running a script is arbitrary code execution. Enable on the server with `-Dghydra.dev.allowScripts=true` or env `GHYDRA_ALLOW_SCRIPTS=1`; otherwise these return `403 SCRIPTS_DISABLED`. Only enable in a trusted/dev environment.
+
+- **`GET /scripts`**: List runnable scripts (name, path, category) from the enabled source directories.
+- **`POST /scripts/run`**: Run a script and return its captured output.
+  - Body (provide one of):
+    - `{ "name": "MyScript.java" }`: run an existing script by file name.
+    - `{ "source": "import ghidra.app.script.GhidraScript; public class X extends GhidraScript { public void run() throws Exception { println(\"hi\"); } }" }`: compile and run ad-hoc GhidraScript source (the class name must match; the file is written to the user script dir and removed after).
+    - `"args": ["a", "b"]` (optional): passed to the script (`getScriptArgs()`).
+  - Runs with the current program as `currentProgram`; use `println(...)` for output.
+  ```json
+  // Example Response
+  "result": {
+    "script": "X.java",
+    "output": "hi\n",
+    "success": true,
+    "error": null
+  }
+  ```
+
+### 12. Open Programs (multi-file)
+
+Manage the programs open in this CodeBrowser. Combine with `?program=` (see [Targeting an Open Program](#targeting-an-open-program)) to work on several binaries without switching.
+
+- **`GET /programs/open-programs`**: List the open programs (`name`, `path`, `language`, `processor`, `imageBase`, `memorySize`, `changed`, `isCurrent`).
+- **`POST /programs/open`**: Open a project file in this tool without making it current. Body: `{ "path": "/in/project/file" }`. Returns `alreadyOpen: true` when it was open already.
+- **`POST /programs/switch`**: Make an open program current. Body: `{ "name": "file.exe" }`.
+- **`POST /programs/close`**: Close an open program. Body: `{ "name": "file.exe", "discard": false }`. Refuses with `400 UNSAVED_CHANGES` when the program has unsaved changes unless `discard` is `true`; save first with `POST /program/save?program=file.exe`.
+
+### 13. Bookmarks
+
+- **`GET /bookmarks`**: List bookmarks (`address`, `type`, `category`, `comment`) with pagination; `?type=[string]` filters by bookmark type.
+- **`POST /bookmarks`**: Create or replace a bookmark. Body: `{ "address": "0x401000", "type": "Note", "category": "todo", "comment": "check this" }` (`type` defaults to `Note`). Returns `201`.
+- **`DELETE /bookmarks/{address}`**: Delete the bookmark(s) of `?type=[string]` (default `Note`) at the address; `404 BOOKMARK_NOT_FOUND` if there are none.
+
+### 14. Batch Operations
+
+Apply many edits in one program transaction. Each item is attempted independently and reported with a `status`; the successful items commit together.
+
+- **`POST /batch/rename-functions`**: Body: `{ "renames": [ { "address": "0x401000", "old_name": "FUN_00401000", "new_name": "ns::parse_header" } ] }`. The function is located by `address` (entry point) first, then by `old_name`; fully-qualified new names move the function into that namespace.
+- **`POST /batch/set-comments`**: Body: `{ "type": "eol", "comments": [ { "address": "0x401000", "comment": "entry", "type": "plate" } ] }`. An item's own `type` wins over the top-level default (`plate`, `pre`, `post`, `eol`, `repeatable`).
+- **`POST /batch/define-data`**: Body: `{ "items": [ { "address": "0x404000", "type": "dword", "label": "magic", "size": 4 } ] }`. `size` is only needed for variable-length types.
+  ```json
+  // Example Response
+  "result": {
+    "total": 2,
+    "successful": 1,
+    "failed": 1,
+    "results": [
+      { "new_name": "main", "address": "00401000", "original_name": "FUN_00401000", "status": "renamed" },
+      { "new_name": "helper", "old_name": "FUN_missing", "status": "not_found" }
+    ]
+  }
+  ```
+
+### 15. Asynchronous Decompilation
+
+For functions that take too long to decompile inside one HTTP request.
+
+- **`POST /functions/decompile-async`**: Queue a decompilation. Body: `{ "address": "0x401000" }` or `{ "name": "ns::func" }`, plus optional `"timeout": 300` (seconds). Returns `202` with `task_id` and `status` (`pending`).
+- **`GET /tasks/{task_id}`**: Task status: `pending`, `running`, `completed`, or `failed` (with `error`).
+- **`GET /tasks/{task_id}/result`**: `202` while the task is unfinished; otherwise the result (`decompiled` holds the C code), or a `TASK_FAILED` error. The task is forgotten once a finished result has been returned; unfetched finished tasks expire after an hour.
 
 ## Design Considerations for AI Usage
 

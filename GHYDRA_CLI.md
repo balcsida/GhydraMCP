@@ -40,10 +40,20 @@ All commands support these global options:
 - `--host, -h TEXT`: Ghidra host (default: from config or localhost)
 - `--port, -p INTEGER`: Ghidra port (default: from config or 8192)
 - `--json`: Output raw JSON instead of formatted text
-- `--no-color`: Disable colored output
+- `--no-color`: Disable colored output (also honored via the `NO_COLOR` environment variable)
 - `--verbose, -v`: Enable verbose output
 - `--version`: Show version and exit
 - `--help`: Show help message
+
+## Agent / programmatic use
+
+For scripts and AI agents, prefer one of these so output is parse-clean:
+
+- `--json` is the recommended programmatic path: structured output you can pipe to `jq`, e.g. `ghydra --json functions list | jq '.result[].name'`.
+- Colored (ANSI) output is auto-disabled whenever stdout is not a terminal (a pipe, a file, or a subprocess capture), so the default table output is already clean when captured by an agent. Color appears only in an interactive terminal.
+- `--no-color` (or `NO_COLOR=1`) forces plain output even in a terminal, if you want tables without ANSI styling.
+
+Earlier versions forced ANSI color codes on regardless of the output target, which corrupted hex-address parsing when an agent captured the output; that is fixed.
 
 ## Configuration
 
@@ -92,6 +102,25 @@ ghydra instances current
 
 # Unregister an instance
 ghydra instances unregister --port 8195
+```
+
+### Programs Commands
+
+Manage the programs open in one Ghidra instance (multi-file support):
+
+```bash
+# List open programs (isCurrent marks the active one)
+ghydra programs list-open
+
+# Open another project file without switching to it
+ghydra programs open /samples/helper.dll
+
+# Make an open program current
+ghydra programs switch helper.dll
+
+# Close a program (refused while it has unsaved changes unless --discard)
+ghydra programs close helper.dll
+ghydra programs close helper.dll --discard
 ```
 
 ### Functions Commands

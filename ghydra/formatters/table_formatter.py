@@ -1,6 +1,8 @@
 """Table-based output formatter using rich library."""
 
 import io
+import os
+import sys
 from typing import Any, Dict
 
 from rich.console import Console
@@ -25,9 +27,14 @@ class TableFormatter(BaseFormatter):
         Args:
             use_colors: Enable colored output
         """
+        # Only colorize when stdout is a real terminal. The old force_terminal=use_colors
+        # leaked ANSI codes into piped output, corrupting programmatic/agent parsing of hex
+        # addresses. Auto-detect the TTY so default output is agent-clean without --no-color,
+        # and honor the NO_COLOR convention (https://no-color.org).
+        self._use_colors = use_colors and not os.environ.get("NO_COLOR") and sys.stdout.isatty()
         self.console = Console(
-            color_system="auto" if use_colors else None,
-            force_terminal=use_colors
+            color_system="auto" if self._use_colors else None,
+            force_terminal=self._use_colors or None,
         )
 
     def _capture(self, renderable) -> str:
@@ -40,11 +47,12 @@ class TableFormatter(BaseFormatter):
             Captured string output
         """
         buffer = io.StringIO()
-        # Create console with same color settings
-        color_sys = "auto" if self.console._color_system else None
+        # Mirror the main console's color decision (TTY-aware) so captured output is
+        # plain when stdout is piped.
         temp_console = Console(
-            file=buffer, color_system=color_sys,
-            force_terminal=self.console._force_terminal
+            file=buffer,
+            color_system="auto" if self._use_colors else None,
+            force_terminal=self._use_colors or None,
         )
         temp_console.print(renderable, soft_wrap=True)
         return buffer.getvalue().rstrip()
@@ -105,7 +113,29 @@ class TableFormatter(BaseFormatter):
     def format_decompiled_code(self, data: Dict[str, Any]) -> str:
         """Format decompiled code with syntax highlighting."""
         result = data.get("result", {})
-        code = result.get("decompiled") or result.get("ccode") or result.get("decompiled_text", "")
+        code = (result.get("decompiled") or result.get("decompilation")
+                or result.get("ccode") or result.get("decompiled_text", ""))
+        retry_recommended = bool(result.get("retry_recommended"))
+        suggested_timeout = result.get("suggested_timeout_seconds")
+        message = result.get("message")
+        decompile_error = result.get("decompile_error")
+
+        advisory_lines = []
+        if retry_recommended:
+            if message:
+                advisory_lines.append(f"// {message}")
+            if suggested_timeout:
+                advisory_lines.append(f"// Suggested timeout: {suggested_timeout}s")
+            if decompile_error:
+                advisory_lines.append(f"// Decompiler error: {decompile_error}")
+
+        if advisory_lines:
+            advisory_text = "\n".join(advisory_lines)
+            if code:
+                if advisory_text.lower() not in code.lower():
+                    code = f"{code.rstrip()}\n\n{advisory_text}"
+            else:
+                code = advisory_text
 
         if not code:
             return self._capture("[red]No decompiled code available[/red]")
@@ -151,15 +181,20 @@ class TableFormatter(BaseFormatter):
         """Format memory as hex dump."""
         result = data.get("result", {})
         addr = result.get("address", "???")
-        hex_bytes = result.get("hexBytes", "")
+        # Javalin server sends "hex" (continuous string); older builds sent
+        # "hexBytes" (space-separated pairs).
+        hex_bytes = result.get("hex") or result.get("hexBytes") or ""
 
         if not hex_bytes:
             return self._capture("[red]No memory data available[/red]")
 
         lines = [f"[cyan]Memory at 0x{addr}:[/cyan]\n"]
 
-        # hexBytes comes as space-separated pairs: "48 83 EC 28..."
-        byte_pairs = hex_bytes.split()
+        if " " in hex_bytes.strip():
+            byte_pairs = hex_bytes.split()
+        else:
+            cleaned = hex_bytes.strip()
+            byte_pairs = [cleaned[i:i+2] for i in range(0, len(cleaned), 2)]
 
         for i in range(0, len(byte_pairs), 16):
             chunk = byte_pairs[i:i+16]
@@ -198,17 +233,55 @@ class TableFormatter(BaseFormatter):
         table.add_column("From Function", style="dim")
 
         for xref in references:
-            from_func = ""
-            if isinstance(xref.get("from_function"), dict):
+            # XrefDto uses fromAddress/toAddress/fromFunction; accept legacy names.
+            from_func = xref.get("fromFunction") or ""
+            if not from_func and isinstance(xref.get("from_function"), dict):
                 from_func = xref["from_function"].get("name", "")
             table.add_row(
-                xref.get("from_addr", "?"),
-                xref.get("to_addr", "?"),
+                xref.get("fromAddress") or xref.get("from_addr", "?"),
+                xref.get("toAddress") or xref.get("to_addr", "?"),
                 xref.get("refType", "?"),
                 from_func
             )
 
         return self._capture(table)
+
+    def format_scalars(self, data: Dict[str, Any]) -> str:
+        """Format scalar search results as table."""
+        results = data.get("result", [])
+        meta = data.get("meta", {}) or {}
+
+        if not results:
+            if meta.get("scanTruncated"):
+                return self._capture("[yellow]No scalars found[/yellow] (scan truncated; "
+                                     "narrow with --in-function or a more specific value)")
+            return self._capture("[yellow]No scalars found[/yellow]")
+
+        offset = meta.get("offset", 0)
+        table = Table(title=f"Scalars ({offset + 1}-{offset + len(results)})", show_lines=False)
+        table.add_column("Address", style="cyan", no_wrap=True)
+        table.add_column("Value", style="green", no_wrap=True)
+        table.add_column("Op", style="dim", no_wrap=True)
+        table.add_column("Instruction", style="yellow", overflow="fold")
+        table.add_column("In Function", style="white")
+        table.add_column("Calls", style="magenta")
+
+        for s in results:
+            table.add_row(
+                s.get("address", "?"),
+                s.get("hexValue", str(s.get("value", "?"))),
+                str(s.get("operandIndex", "")),
+                s.get("instruction", ""),
+                s.get("inFunction") or "-",
+                s.get("toFunction") or "",
+            )
+
+        output = self._capture(table)
+        if meta.get("scanTruncated"):
+            output += "\n" + self._capture("[yellow]Scan truncated to keep the UI responsive; "
+                                           "results may be incomplete - narrow with --in-function "
+                                           "or a more specific value.[/yellow]")
+        return output
 
     def format_data_list(self, data: Dict[str, Any]) -> str:
         """Format data items list as table."""
@@ -230,7 +303,7 @@ class TableFormatter(BaseFormatter):
 
             table.add_row(
                 item.get("address", "?"),
-                item.get("name", ""),
+                item.get("label") or item.get("name", ""),  # DataDto field is 'label'
                 item.get("dataType", "?"),
                 str(value)
             )
@@ -352,6 +425,17 @@ class TableFormatter(BaseFormatter):
         if isinstance(result, dict) and "message" in result:
             return self._capture(f"[green]{result['message']}[/green]")
 
+        if isinstance(result, list):
+            if not result:
+                return self._capture("[green]Success[/green] (no items)")
+            rows = []
+            for item in result:
+                if isinstance(item, dict):
+                    rows.append(", ".join(f"{k}: {v}" for k, v in item.items() if k != "_links"))
+                else:
+                    rows.append(str(item))
+            return self._capture("\n".join(rows))
+
         lines = []
         for key, value in result.items():
             if key not in ("_links",):
@@ -392,15 +476,13 @@ class TableFormatter(BaseFormatter):
         table.add_column("Address", style="cyan", no_wrap=True)
         table.add_column("Type", style="yellow")
         table.add_column("Name", style="green")
-        table.add_column("Namespace", style="dim")
 
         for item in result:
             primary = " *" if item.get("isPrimary") else ""
             table.add_row(
                 item.get("address", "?"),
                 item.get("type", "?"),
-                item.get("name", "?") + primary,
-                item.get("namespace", "")
+                item.get("name", "?") + primary
             )
 
         return self._capture(table)
@@ -421,11 +503,12 @@ class TableFormatter(BaseFormatter):
         table.add_column("Init", style="dim")
 
         for seg in result:
+            # MemoryBlockDto serializes isRead/isWrite/isExecute/isInitialized.
             perms = ""
-            perms += "R" if seg.get("readable") else "-"
-            perms += "W" if seg.get("writable") else "-"
-            perms += "X" if seg.get("executable") else "-"
-            init = "init" if seg.get("initialized") else "uninit"
+            perms += "R" if seg.get("isRead", seg.get("readable")) else "-"
+            perms += "W" if seg.get("isWrite", seg.get("writable")) else "-"
+            perms += "X" if seg.get("isExecute", seg.get("executable")) else "-"
+            init = "init" if seg.get("isInitialized", seg.get("initialized")) else "uninit"
             table.add_row(
                 seg.get("name", "?"),
                 seg.get("start", "?"),
@@ -500,6 +583,103 @@ class TableFormatter(BaseFormatter):
             )
 
         return self._capture(table)
+
+    def format_callgraph(self, data: Dict[str, Any]) -> str:
+        """Format analysis callgraph as a readable tree with summary.
+
+        Server shape: {root: {name, address, ...}, depth, direction,
+                       callers: [{function: {...}, callers: [...]}],
+                       callees: [{function: {...}, callees: [...]}]}
+        """
+        result = data.get("result", {})
+        if not isinstance(result, dict) or not isinstance(result.get("root"), dict):
+            return self._capture("[yellow]No call graph data available[/yellow]")
+
+        root = result["root"]
+        root_name = root.get("name", "?")
+        root_addr = root.get("address", "")
+        depth = result.get("depth")
+
+        summary = self._capture(
+            f"[cyan]Call Graph[/cyan] for {root_name} ({root_addr})"
+            + (f" depth={depth}" if depth is not None else "")
+        )
+
+        def build_tree(title: str, nodes, child_key: str) -> str:
+            tree = Tree(f"[cyan]{title}[/cyan]")
+
+            def add_nodes(parent, items, level=0, budget=None):
+                if budget is None:
+                    budget = [200]
+                if not isinstance(items, list):
+                    return
+                for node in items:
+                    if budget[0] <= 0:
+                        parent.add("[dim]...[/dim]")
+                        return
+                    if not isinstance(node, dict):
+                        continue
+                    fn = node.get("function", {})
+                    label = f"{fn.get('name', '?')} ({fn.get('address', '?')})"
+                    child = parent.add(f"[green]{label}[/green]")
+                    budget[0] -= 1
+                    add_nodes(child, node.get(child_key), level + 1, budget)
+
+            add_nodes(tree, nodes)
+            return self._capture(tree)
+
+        parts = [summary]
+        callers = result.get("callers")
+        if callers is not None:
+            parts.append(build_tree(f"Callers ({len(callers)})", callers, "callers")
+                         if callers else self._capture("[yellow]No callers[/yellow]"))
+        callees = result.get("callees")
+        if callees is not None:
+            parts.append(build_tree(f"Callees ({len(callees)})", callees, "callees")
+                         if callees else self._capture("[yellow]No callees[/yellow]"))
+
+        return "\n".join(parts)
+
+    def format_dataflow(self, data: Dict[str, Any]) -> str:
+        """Format analysis dataflow output."""
+        result = data.get("result", {})
+        if not isinstance(result, dict):
+            return self._capture("[yellow]No data flow data available[/yellow]")
+
+        steps = result.get("steps", [])
+        if not isinstance(steps, list):
+            steps = []
+
+        table = Table(title="Data Flow", show_lines=False)
+        table.add_column("Step", style="cyan", justify="right")
+        table.add_column("Address", style="green", no_wrap=True)
+        table.add_column("Instruction", style="white", overflow="fold")
+        table.add_column("Function", style="dim")
+        table.add_column("Refs", style="yellow", justify="right")
+
+        for i, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                continue
+            # Server steps carry instruction text + containing function + references.
+            table.add_row(
+                str(i),
+                str(step.get("address", step.get("to", step.get("from", "?")))),
+                str(step.get("instruction", step.get("description", step.get("label", "")))),
+                str(step.get("function", "")),
+                str(step.get("reference_count", len(step.get("references", []))))
+            )
+
+        header = []
+        for key in ("start_address", "address", "direction", "max_steps", "truncated"):
+            if key in result:
+                header.append(f"[cyan]{key}:[/cyan] {result.get(key)}")
+
+        if not table.rows:
+            return self._capture("\n".join(header) if header else "[yellow]No data flow steps found[/yellow]")
+
+        header_text = self._capture("\n".join(header)) if header else ""
+        body = self._capture(table)
+        return f"{header_text}\n{body}".strip()
 
     def format_error(self, error: Exception) -> str:
         """Format error message."""
