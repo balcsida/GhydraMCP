@@ -39,10 +39,10 @@ GhydraMCP consists of three main components:
 
 ### Prerequisites
 
-- Java 21 (required for plugin development)
+- Java 25 (required to build against Ghidra 12.2+; output bytecode targets Java 21 so the plugin also runs on Ghidra 11.x)
 - Maven 3.8+
 - Python 3.11+
-- Ghidra 12.x (built/tested against 12.1.2). Build with `GHIDRA_HOME` pointing at your install.
+- Ghidra 12.x (built/tested against 12.2). Build with `GHIDRA_HOME` pointing at your install.
 
 ### Building from Source
 
@@ -52,7 +52,7 @@ git clone https://github.com/starsong-consulting/GhydraMCP.git
 cd GhydraMCP
 
 # Build the project (point GHIDRA_HOME at your Ghidra 12.x install)
-GHIDRA_HOME=/path/to/ghidra_12.1.2_PUBLIC mvn clean package
+GHIDRA_HOME=/path/to/ghidra_12.2_PUBLIC mvn clean package
 ```
 
 This creates:

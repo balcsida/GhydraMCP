@@ -25,10 +25,10 @@ jobs:
           # Full history so git-commit-id's `describe` can name artifacts after tags.
           fetch-depth: 0
 
-      - name: Set up JDK 21
+      - name: Set up JDK 25
         uses: actions/setup-java@v5
         with:
-          java-version: '21'
+          java-version: '25'  # Ghidra 12.2+ jars are Java 25 class files; bytecode still targets 21 for 11.x
           distribution: 'temurin'
           cache: maven
 
