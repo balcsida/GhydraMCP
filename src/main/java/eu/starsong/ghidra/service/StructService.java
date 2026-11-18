@@ -169,11 +169,40 @@ public class StructService {
             if (struct == null) {
                 throw new NotFoundException("Struct not found: " + name, "STRUCT_NOT_FOUND");
             }
-            // 2-arg remove exists in both 11.x and 12.x (12.x deprecates it but keeps it);
-            // the 1-arg form is 12.x-only. Use the 2-arg form for cross-version compile.
-            program.getDataTypeManager().remove(struct, ghidra.util.task.TaskMonitor.DUMMY);
+            removeDataType(program.getDataTypeManager(), struct);
             return null;
         });
+    }
+
+    /**
+     * Remove a data type across Ghidra versions. There is no single-DataType remove
+     * method common to all supported releases:
+     * <ul>
+     *   <li>11.x: only {@code remove(DataType, TaskMonitor)}</li>
+     *   <li>12.0/12.1: both {@code remove(DataType)} and the deprecated 2-arg form</li>
+     *   <li>12.2+: only {@code remove(DataType)} (2-arg form removed)</li>
+     * </ul>
+     * so resolve the method reflectively to keep a single build working on all of them.
+     */
+    private static void removeDataType(DataTypeManager dtm, DataType dt) throws Exception {
+        java.lang.reflect.Method m;
+        Object[] args;
+        try {
+            m = DataTypeManager.class.getMethod("remove", DataType.class);
+            args = new Object[] { dt };
+        } catch (NoSuchMethodException e) {
+            m = DataTypeManager.class.getMethod("remove", DataType.class,
+                ghidra.util.task.TaskMonitor.class);
+            args = new Object[] { dt, ghidra.util.task.TaskMonitor.DUMMY };
+        }
+        try {
+            m.invoke(dtm, args);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception ex) throw ex;
+            if (cause instanceof Error err) throw err;
+            throw e;
+        }
     }
 
     private Structure findStruct(Program program, String name) {

@@ -92,7 +92,7 @@ Download the latest [release](https://github.com/balcsida/GhydraMCP/releases) fr
 1. Run Ghidra
 2. Select `File` -> `Install Extensions`
 3. Click the `+` button
-4. Select the `Ghydra-*-ghidra<version>.zip` that matches your Ghidra version (e.g. `...-ghidra12.1.2.zip` for Ghidra 12.1.2)
+4. Select the `Ghydra-*-ghidra<version>.zip` that matches your Ghidra version (e.g. `...-ghidra12.2.zip` for Ghidra 12.2)
 5. Restart Ghidra
 6. Make sure the Ghydra plugin is enabled in `File` -> `Configure` -> `Developer`
 
@@ -217,7 +217,7 @@ Tools are organized into namespaces:
 Set the `GHIDRA_HOME` environment variable to your Ghidra installation (11.x or 12.x):
 
 ```bash
-export GHIDRA_HOME=/path/to/ghidra_12.1.2_PUBLIC
+export GHIDRA_HOME=/path/to/ghidra_12.2_PUBLIC
 ```
 
 The build compiles against the JARs in `GHIDRA_HOME` and stamps the extension with the version from `$GHIDRA_HOME/Ghidra/application.properties`, so install the result into that same Ghidra version.

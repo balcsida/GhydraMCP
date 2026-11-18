@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Ghidra 12.2 support:** the plugin builds and runs against Ghidra 12.2. Struct deletion now picks the right `DataTypeManager.remove` overload at runtime, because 12.2 dropped the deprecated `remove(DataType, TaskMonitor)` that 11.x needs.
+- CI and local builds now need JDK 25, since Ghidra 12.2's jars are Java 25 class files. Output bytecode still targets Java 21, so the 11.x build keeps working.
+
 ## [3.1.0] - 2026-09-27
 
 Fork (balcsida/GhydraMCP) changes on top of upstream 3.0.0-rc.1, ported onto the Javalin server.
