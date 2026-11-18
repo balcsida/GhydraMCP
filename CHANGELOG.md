@@ -6,9 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-11-18
+
 ### Changed
 - **Ghidra 12.2 support:** the plugin builds and runs against Ghidra 12.2. Struct deletion now picks the right `DataTypeManager.remove` overload at runtime, because 12.2 dropped the deprecated `remove(DataType, TaskMonitor)` that 11.x needs.
 - CI and local builds now need JDK 25, since Ghidra 12.2's jars are Java 25 class files. Output bytecode still targets Java 21, so the 11.x build keeps working.
+- **Bridge:** the `mcp` dependency now allows any 1.x release from 1.6.0 (`>=1.6.0,<2`) instead of pinning `==1.6.0`, for compatibility with newer Python versions.
 
 ## [3.1.0] - 2026-09-27
 
@@ -173,7 +176,8 @@ Fork (balcsida/GhydraMCP) changes on top of upstream 3.0.0-rc.1, ported onto the
 - Initial project setup
 - Basic MCP bridge functionality
 
-[unreleased]: https://github.com/balcsida/GhydraMCP/compare/v3.1.0...HEAD
+[unreleased]: https://github.com/balcsida/GhydraMCP/compare/v3.2.0...HEAD
+[3.2.0]: https://github.com/balcsida/GhydraMCP/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/balcsida/GhydraMCP/compare/v2.3.0...v3.1.0
 [3.0.0-rc.1]: https://github.com/starsong-consulting/GhydraMCP/compare/v3.0.0-beta...v3.0.0-rc.1
 [2.0.0]: https://github.com/teal-bauer/GhydraMCP/compare/v1.4.0...v2.0.0
